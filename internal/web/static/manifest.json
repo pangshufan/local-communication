@@ -1,0 +1,9 @@
+{
+  "name": "LanChat - 局域网无中心多端互传",
+  "short_name": "LanChat",
+  "description": "默认隐身、零中心、极低内存占用的跨平台局域网即时通讯与文件流式传输工作台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1120",
+  "theme_color": "#0f172a"
+}

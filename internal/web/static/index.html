@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>LanChat · 局域网无中心多端互传</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Left Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-header">
+        <div class="brand-title">
+          <span>⚡ LanChat</span>
+          <span class="stealth-badge" id="stealthBadge">🔒 默认隐身</span>
+        </div>
+        <button class="btn btn-sm mobile-menu-btn" id="closeSidebarBtn">✕</button>
+      </div>
+
+      <!-- Current Device Card -->
+      <div class="self-card">
+        <div class="self-row">
+          <span style="color:var(--text-muted)">本机节点</span>
+          <strong id="selfName">加载中...</strong>
+        </div>
+        <div class="self-row">
+          <span style="color:var(--text-muted)">局域网地址</span>
+          <span class="mono-tag" id="selfAddr">-</span>
+        </div>
+        <div class="self-row">
+          <span style="color:var(--text-muted)">本机配对码</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="mono-tag" id="selfPIN" style="color:#fcd34d;font-weight:700">------</span>
+            <button class="btn btn-sm" id="copyPairUriBtn" title="复制 IP:Port#配对码">复制直连串</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Discoverable Switch -->
+      <div class="discovery-box">
+        <div class="switch-row">
+          <div>
+            <div class="switch-label">允许被局域网扫描发现</div>
+            <div class="switch-sub" id="discoverSubText">当前静默：不响应任何公开广播探测</div>
+          </div>
+          <button class="toggle-btn" id="toggleDiscoverBtn">已关闭</button>
+        </div>
+      </div>
+
+      <!-- Quick Actions -->
+      <div class="action-grid">
+        <button class="btn btn-primary" id="openPairModalBtn">➕ 添加电脑</button>
+        <button class="btn" id="openMobileQRBtn">📱 手机扫码</button>
+      </div>
+
+      <!-- Channels & Trusted Devices -->
+      <div class="section-header">
+        <span>消息通道 / 已配对设备</span>
+        <span id="onlineCountText">0 在线</span>
+      </div>
+      <div class="peer-list" id="peerList">
+        <!-- Populated by app.js -->
+      </div>
+
+      <!-- Memory RingBuffer Watermark Footer -->
+      <div class="memory-footer">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--text-muted)">内存池水位 (退出即焚)</span>
+          <span id="memText" style="font-family:monospace">0 KB / 20 MB</span>
+        </div>
+        <div class="mem-bar-bg">
+          <div class="mem-bar-fill" id="memBarFill"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+          <span style="color:var(--text-muted);font-size:11px" id="msgCountText">0 / 200 条记录</span>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-sm btn-danger" id="clearLocalBtn" title="仅清空本机内存记录">清空本机</button>
+            <button class="btn btn-sm btn-danger" id="clearAllBtn" title="同步清空所有已连接设备的内存记录">全端焚毁</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Chat & File Stream Area -->
+    <main class="chat-main" id="chatMain">
+      <div class="drop-overlay" id="dropOverlay">
+        <div style="font-size:38px">📂</div>
+        <div style="font-size:18px;font-weight:700">松开鼠标，立即流式直传文件</div>
+        <div style="font-size:13px;color:var(--text-muted)">固定 64KB 流式分块传输 · 不占用内存池 · 自动计算 SHA-256</div>
+      </div>
+
+      <header class="chat-topbar">
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="mobile-menu-btn" id="openSidebarBtn">☰ 设备</button>
+          <div>
+            <div class="channel-title" id="activeChannelTitle">🌐 全设备公共消息流</div>
+            <div class="channel-subtitle" id="activeChannelSub">在此发送的文字、粘贴截图与文件将实时同步至所有已配对设备与手机</div>
+          </div>
+        </div>
+      </header>
+
+      <section class="message-stream" id="messageStream">
+        <div class="empty-state" id="emptyState">
+          <div style="font-size:32px;margin-bottom:8px">⚡</div>
+          <div style="font-weight:600;color:var(--text-main);margin-bottom:6px">暂无消息 · 内存零驻留</div>
+          <div style="font-size:13px;line-height:1.6">
+            支持直接发送文字/代码、<strong>Ctrl+V / Cmd+V 粘贴剪贴板截图</strong>、或<strong>拖拽任意大小的文件</strong>。<br/>
+            所有聊天记录仅保存在环形内存池中，关闭程序即彻底无痕。
+          </div>
+        </div>
+      </section>
+
+      <footer class="composer">
+        <div class="upload-status" id="uploadStatus">
+          <span id="uploadStatusText">正在上传...</span>
+          <strong id="uploadPercentText">0%</strong>
+        </div>
+
+        <div class="composer-toolbar">
+          <div class="toolbar-left">
+            <input type="file" id="fileInput" multiple style="display:none" />
+            <button class="btn btn-sm" id="selectFileBtn">📁 选择文件 / 图片</button>
+            <button class="btn btn-sm" id="localPathBtn" title="本机大文件无需复制上传，直接注册磁盘路径供其他设备拉取">⚡ 本机大文件零拷贝直传</button>
+            <span style="font-size:11px;color:var(--text-muted)">💡 支持直接粘贴截图 (Ctrl+V) 或拖拽多文件到窗口</span>
+          </div>
+        </div>
+
+        <div class="composer-row">
+          <textarea
+            id="msgInput"
+            class="composer-input"
+            placeholder="输入文字或代码片段... (Enter 发送，Shift+Enter 换行，Ctrl+V 直接粘贴截图/文件)"
+            rows="2"
+          ></textarea>
+          <button class="btn btn-primary" id="sendBtn" style="height:44px;padding:0 20px">发送</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Modal 1: Pair New Computer -->
+  <div class="modal-backdrop" id="pairModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>➕ 配对新电脑节点</span>
+        <button class="btn btn-sm" data-close="pairModal">✕</button>
+      </div>
+
+      <div style="font-size:12px;color:var(--text-muted);line-height:1.5">
+        <strong>方式一（完全隐身直连，推荐）</strong>：直接粘贴对方界面左上角的 <span class="mono-tag">IP:Port#配对码</span>，无需任何一方开启广播：
+      </div>
+      <div style="display:flex;gap:8px">
+        <input class="input-field" id="pairDirectInput" placeholder="例如 192.168.1.25:52520#839201" />
+        <button class="btn btn-primary" id="pairDirectBtn" style="white-space:nowrap">立即配对</button>
+      </div>
+
+      <hr style="border:0;border-top:1px solid var(--border)" />
+
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:12px;color:var(--text-muted)"><strong>方式二（局域网扫描）</strong>：仅显示已打开「允许被发现」开关的设备</span>
+        <button class="btn btn-sm" id="scanLanBtn">🔍 扫描局域网</button>
+      </div>
+      <div id="scanResultList" style="display:flex;flex-direction:column;gap:8px;max-height:180px;overflow-y:auto">
+        <div style="font-size:12px;color:var(--text-muted);text-align:center;padding:12px">点击上方「扫描局域网」查找已开启发现开关的设备</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 2: Mobile QR Connection -->
+  <div class="modal-backdrop" id="mobileModal">
+    <div class="modal-card" style="text-align:center">
+      <div class="modal-header">
+        <span>📱 手机扫码免安装直连 (PWA)</span>
+        <button class="btn btn-sm" data-close="mobileModal">✕</button>
+      </div>
+      <div style="font-size:12px;color:var(--text-muted)">
+        确保手机与本机在同一 Wi-Fi / 局域网下，用相机或浏览器扫码即可实时互传文字、相册原图与文件：
+      </div>
+      <div id="mobileIpSelectWrap" style="display:flex;align-items:center;justify-content:center;gap:8px;font-size:12px">
+        <span>网卡 IP：</span>
+        <select id="mobileIpSelect" class="input-field" style="width:auto;padding:4px 8px"></select>
+      </div>
+      <div class="qr-box" id="qrSvgContainer">正在生成二维码...</div>
+      <div class="mono-tag" id="mobileUrlText" style="word-break:break-all;padding:8px"></div>
+      <div style="font-size:11px;color:var(--text-muted)">
+        💡 扫码打开后，可在 iOS Safari 或 Android Chrome 点击「添加到主屏幕」，获得与原生 App 一致的全屏体验。
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal 3: Zero-Copy Local File Path Registration -->
+  <div class="modal-backdrop" id="localPathModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>⚡ 本机大文件零拷贝直传</span>
+        <button class="btn btn-sm" data-close="localPathModal">✕</button>
+      </div>
+      <div style="font-size:12px;color:var(--text-muted);line-height:1.5">
+        输入本机磁盘上的文件绝对路径（哪怕是 50GB 的视频或系统镜像），不会复制文件或占用任何内存，其他设备点击下载时直接从原路径以 64KB 缓冲流式读取：
+      </div>
+      <input class="input-field" id="localFilePathInput" placeholder="例如 /Volumes/T9/movie.mp4 或 C:\Users\me\archive.zip" />
+      <div style="display:flex;justify-content:flex-end;gap:8px">
+        <button class="btn" data-close="localPathModal">取消</button>
+        <button class="btn btn-primary" id="confirmLocalPathBtn">立即发布文件卡片</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
