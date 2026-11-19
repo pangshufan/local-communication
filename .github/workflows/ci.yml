@@ -35,7 +35,12 @@ jobs:
         run: node --test internal/web/frontend.test.cjs
       - name: Format check
         shell: bash
-        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [ -n "$unformatted" ]; then
+            printf 'Files requiring gofmt:\n%s\n' "$unformatted"
+            exit 1
+          fi
   package:
     name: Package (${{ matrix.goos }}/${{ matrix.goarch }})
     needs: test
