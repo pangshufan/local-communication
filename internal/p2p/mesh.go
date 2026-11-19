@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -42,6 +43,7 @@ type PairRequest struct {
 	SharedKeyHex string `json:"shared_key_hex"`
 	HTTPPort     int    `json:"http_port"`
 	PIN          string `json:"pin"`
+	Signature    string `json:"signature,omitempty"`
 }
 
 // PairResponse is returned when the 6-digit PIN is verified.
@@ -66,10 +68,14 @@ type MeshEngine struct {
 	httpPort     int
 	udpPort      int
 	udpConn      *net.UDPConn
-	httpClient   *http.Client
 	onNewMessage func(msg *store.Message)
 	onPeerChange func()
 	stopCh       chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
+	jobs         chan deliveryJob
+	onDelivery   func(string, map[string]string)
+	stopOnce     sync.Once
 	wg           sync.WaitGroup
 }
 
@@ -84,14 +90,13 @@ func NewMeshEngine(
 	if udpPort <= 0 {
 		udpPort = DefaultUDPPort
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &MeshEngine{
-		identity: im,
-		ring:     rb,
-		httpPort: httpPort,
-		udpPort:  udpPort,
-		httpClient: &http.Client{
-			Timeout: 4 * time.Second,
-		},
+		ctx: ctx, cancel: cancel, jobs: make(chan deliveryJob, 256),
+		identity:     im,
+		ring:         rb,
+		httpPort:     httpPort,
+		udpPort:      udpPort,
 		onNewMessage: onNewMessage,
 		onPeerChange: onPeerChange,
 		stopCh:       make(chan struct{}),
@@ -113,13 +118,17 @@ func (m *MeshEngine) Start() error {
 		go m.udpListenLoop()
 	}
 
+	for i := 0; i < 4; i++ {
+		m.wg.Add(1)
+		go m.deliveryWorker()
+	}
 	m.wg.Add(1)
 	go m.trustedHeartbeatLoop()
-	return nil
+	return err
 }
 
 func (m *MeshEngine) Stop() {
-	close(m.stopCh)
+	m.stopOnce.Do(func() { close(m.stopCh); m.cancel() })
 	if m.udpConn != nil {
 		_ = m.udpConn.Close()
 	}
@@ -224,22 +233,38 @@ func (m *MeshEngine) ScanDiscoverablePeers(timeout time.Duration) ([]DiscoveredN
 
 // PairWithPeer initiates pairing with a remote node at targetAddr using its 6-digit PIN.
 func (m *MeshEngine) PairWithPeer(targetAddr string, pin string) (*crypto.TrustedPeer, error) {
+	fingerprint := ""
 	targetAddr = strings.TrimSpace(targetAddr)
 	targetAddr = strings.TrimPrefix(targetAddr, "http://")
 	targetAddr = strings.TrimPrefix(targetAddr, "https://")
 	if idx := strings.Index(targetAddr, "#"); idx != -1 {
-		if pin == "" {
-			pin = strings.TrimSpace(targetAddr[idx+1:])
+		fragment := strings.Split(targetAddr[idx+1:], "@")
+		if len(fragment) == 2 {
+			fingerprint = strings.TrimSpace(fragment[1])
+			if pin == "" {
+				pin = strings.TrimSpace(fragment[0])
+			}
 		}
 		targetAddr = strings.TrimSpace(targetAddr[:idx])
 	}
 	if !strings.Contains(targetAddr, ":") {
 		targetAddr = fmt.Sprintf("%s:%d", targetAddr, m.httpPort)
 	}
+	if fingerprint == "" {
+		return nil, errors.New("complete pairing string with device fingerprint required")
+	}
 	if pin == "" {
 		return nil, errors.New("6-digit pairing PIN is required")
 	}
 
+	if _, _, err := net.SplitHostPort(targetAddr); err != nil {
+		return nil, errors.New("invalid device address")
+	}
+	client, err := crypto.PinnedClient(fingerprint, 8*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer client.CloseIdleConnections()
 	sharedSecret := crypto.GenerateSharedSecret()
 	reqPayload := PairRequest{
 		PeerID:       m.identity.PeerID(),
@@ -250,10 +275,12 @@ func (m *MeshEngine) PairWithPeer(targetAddr string, pin string) (*crypto.Truste
 		HTTPPort:     m.httpPort,
 		PIN:          pin,
 	}
+	proof, _ := json.Marshal(reqPayload)
+	reqPayload.Signature = m.identity.SignPairing(proof)
 	body, _ := json.Marshal(reqPayload)
-	url := fmt.Sprintf("http://%s/api/p2p/pair", targetAddr)
+	url := fmt.Sprintf("https://%s/api/p2p/pair", targetAddr)
 
-	resp, err := m.httpClient.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s failed: %w", targetAddr, err)
 	}
@@ -269,6 +296,14 @@ func (m *MeshEngine) PairWithPeer(targetAddr string, pin string) (*crypto.Truste
 		return nil, fmt.Errorf("invalid pair response: %w", err)
 	}
 
+	if !crypto.ValidPeerIdentity(pairResp.PeerID, pairResp.PublicKeyHex) {
+		return nil, errors.New("invalid paired identity")
+	}
+	pub, _ := hex.DecodeString(pairResp.PublicKeyHex)
+	fp := sha256.Sum256(pub)
+	if hex.EncodeToString(fp[:]) != fingerprint {
+		return nil, errors.New("pair response identity mismatch")
+	}
 	peer := crypto.TrustedPeer{
 		PeerID:       pairResp.PeerID,
 		Name:         pairResp.Name,
@@ -292,7 +327,11 @@ func (m *MeshEngine) PairWithPeer(targetAddr string, pin string) (*crypto.Truste
 func (m *MeshEngine) trustedHeartbeatLoop() {
 	defer m.wg.Done()
 	// Run an initial check shortly after startup
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-m.ctx.Done():
+		return
+	case <-time.After(500 * time.Millisecond):
+	}
 	m.checkAllTrustedPeers()
 
 	ticker := time.NewTicker(8 * time.Second)
@@ -323,6 +362,9 @@ func (m *MeshEngine) checkAllTrustedPeers() {
 			m.identity.SetPeerOnline(p.PeerID, p.LastAddr, false)
 			// Send opaque 50-byte HMAC silent probe in case DHCP changed the trusted peer's IP
 			m.sendSilentProbe(p.PeerID)
+		}
+		if !wasOnline && ok {
+			m.retryFailed(p.PeerID)
 		}
 		if wasOnline != ok {
 			changed = true
@@ -366,34 +408,118 @@ func (m *MeshEngine) pingTrustedPeer(peerID string, addr string) bool {
 	return false
 }
 
-// PushMessageToPeers asynchronously delivers a message to all online trusted peers (or a single target peer).
-func (m *MeshEngine) PushMessageToPeers(msg *store.Message) {
-	wire := WireMessage{
-		Message: msg,
-	}
-	if msg.Kind == store.KindImage && len(msg.InlineData) > 0 {
-		wire.InlineDataBase64 = base64.StdEncoding.EncodeToString(msg.InlineData)
-	}
-	body, err := json.Marshal(wire)
-	if err != nil {
-		return
-	}
+type deliveryJob struct{ id, peer string }
 
-	peers := m.identity.ListTrustedPeers()
-	for _, p := range peers {
-		if msg.TargetPeerID != "" && msg.TargetPeerID != p.PeerID {
-			continue
+func (m *MeshEngine) SetDeliveryCallback(cb func(string, map[string]string)) { m.onDelivery = cb }
+
+// PrepareDelivery reserves bounded recipient metadata before storing the message.
+func (m *MeshEngine) PrepareDelivery(msg *store.Message) {
+	msg.Delivery = map[string]string{}
+	for _, p := range m.identity.ListTrustedPeers() {
+		if msg.TargetPeerID == "" || msg.TargetPeerID == p.PeerID {
+			msg.Delivery[p.PeerID] = "pending"
 		}
-		if p.LastAddr == "" {
-			continue
+	}
+}
+func (m *MeshEngine) PushMessageToPeers(msg *store.Message) {
+	for peer := range msg.Delivery {
+		m.enqueue(deliveryJob{msg.ID, peer})
+	}
+}
+func (m *MeshEngine) enqueue(job deliveryJob) {
+	select {
+	case <-m.ctx.Done():
+		return
+	default:
+	}
+	select {
+	case m.jobs <- job:
+	default:
+		m.deliveryStatus(job, "failed")
+	}
+}
+func (m *MeshEngine) deliveryStatus(job deliveryJob, status string) {
+	if m.ring.SetDelivery(job.id, job.peer, status) && m.onDelivery != nil {
+		if msg, ok := m.ring.GetMessage(job.id); ok {
+			m.onDelivery(job.id, msg.Delivery)
 		}
-		go func(peer crypto.TrustedPeer) {
-			resp, err := m.doSignedPost(peer.PeerID, peer.LastAddr, "/api/p2p/message", body)
-			if err == nil {
-				_ = resp.Body.Close()
-				m.identity.SetPeerOnline(peer.PeerID, peer.LastAddr, true)
+	}
+}
+func (m *MeshEngine) retryFailed(peer string) {
+	for _, msg := range m.ring.List(m.identity.PeerID()) {
+		if msg.SenderID == m.identity.PeerID() && msg.Delivery[peer] == "failed" {
+			job := deliveryJob{msg.ID, peer}
+			m.deliveryStatus(job, "pending")
+			m.enqueue(job)
+		}
+	}
+}
+func (m *MeshEngine) RetryMessage(id string) bool {
+	msg, ok := m.ring.GetMessage(id)
+	if !ok || msg.SenderID != m.identity.PeerID() {
+		return false
+	}
+	for peer, status := range msg.Delivery {
+		if status == "failed" {
+			job := deliveryJob{id, peer}
+			m.deliveryStatus(job, "pending")
+			m.enqueue(job)
+		}
+	}
+	return true
+}
+func (m *MeshEngine) deliveryWorker() {
+	defer m.wg.Done()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case job := <-m.jobs:
+			success := false
+			for attempt := 0; attempt < 3; attempt++ {
+				msg, exists := m.ring.GetMessage(job.id)
+				if !exists {
+					break
+				}
+				peer, trusted := m.identity.GetTrustedPeer(job.peer)
+				if !trusted {
+					break
+				}
+				wire := WireMessage{Message: msg}
+				wire.Message.Delivery = nil
+				if msg.Kind == store.KindImage {
+					wire.InlineDataBase64 = base64.StdEncoding.EncodeToString(msg.InlineData)
+				}
+				body, err := json.Marshal(wire)
+				if err != nil {
+					break
+				}
+				resp, err := m.doSignedPost(peer.PeerID, peer.LastAddr, "/api/p2p/message", body)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+					resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						success = true
+						break
+					}
+					if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+						break
+					}
+				}
+				if attempt < 2 {
+					select {
+					case <-m.ctx.Done():
+						return
+					case <-time.After(time.Duration(attempt+1) * time.Second):
+					}
+				}
 			}
-		}(p)
+			if success {
+				m.deliveryStatus(job, "delivered")
+			} else {
+				m.deliveryStatus(job, "failed")
+			}
+		}
 	}
 }
 
@@ -416,12 +542,13 @@ func (m *MeshEngine) doSignedPost(targetPeerID string, addr string, path string,
 	ts := time.Now().UnixMilli()
 	sum := sha256.Sum256(body)
 	bodyHash := hex.EncodeToString(sum[:])
-	sig, err := m.identity.SignPeerRequest(targetPeerID, ts, bodyHash)
+	nonce := crypto.GenerateSharedSecret()[:32]
+	sig, err := m.identity.SignPeerRequest(targetPeerID, ts, http.MethodPost, path, nonce, bodyHash)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s%s", addr, path), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(m.ctx, http.MethodPost, fmt.Sprintf("https://%s%s", addr, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +557,13 @@ func (m *MeshEngine) doSignedPost(targetPeerID string, addr string, path string,
 	req.Header.Set("X-LanChat-Ts", strconv.FormatInt(ts, 10))
 	req.Header.Set("X-LanChat-Sig", sig)
 	req.Header.Set("X-LanChat-Port", strconv.Itoa(m.httpPort))
-	return m.httpClient.Do(req)
+	req.Header.Set("X-LanChat-Nonce", nonce)
+	client, err := m.identity.PeerClient(targetPeerID, 4*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer client.CloseIdleConnections()
+	return client.Do(req)
 }
 
 // GetLANIPs returns all non-loopback IPv4 addresses of the current machine.

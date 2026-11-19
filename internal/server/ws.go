@@ -24,8 +24,11 @@ type WSEvent struct {
 }
 
 type wsClient struct {
-	conn net.Conn
-	mu   sync.Mutex
+	valid func() bool
+	conn  net.Conn
+	mu    sync.Mutex
+	queue chan []byte
+	done  chan struct{}
 }
 
 func (c *wsClient) writeText(payload []byte) error {
@@ -93,25 +96,34 @@ func (h *WSHub) Broadcast(eventType string, data any) {
 	h.mu.RUnlock()
 
 	for _, c := range list {
-		if err := c.writeText(payload); err != nil {
+		select {
+		case c.queue <- payload:
+		default:
 			h.remove(c)
 		}
 	}
+
 }
 
 func (h *WSHub) remove(c *wsClient) {
 	h.mu.Lock()
 	if _, ok := h.clients[c]; ok {
 		delete(h.clients, c)
+		close(c.done)
 		_ = c.conn.Close()
 	}
 	h.mu.Unlock()
 }
 
 // ServeWS upgrades an HTTP request to a RFC 6455 WebSocket connection using pure Go stdlib.
-func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request, onConnect func(send func(eventType string, data any))) {
+func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request, onConnect func(send func(eventType string, data any)), valid ...func() bool) {
+	if r.Method != http.MethodGet || !sameOrigin(r) || r.Header.Get("Origin") == "" || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !headerToken(r.Header.Get("Connection"), "upgrade") || r.Header.Get("Sec-WebSocket-Version") != "13" {
+		http.Error(w, "invalid websocket handshake", 400)
+		return
+	}
 	key := strings.TrimSpace(r.Header.Get("Sec-Websocket-Key"))
-	if key == "" {
+	decoded, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(decoded) != 16 {
 		http.Error(w, "missing Sec-WebSocket-Key", http.StatusBadRequest)
 		return
 	}
@@ -141,8 +153,16 @@ func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request, onConnect func(s
 		return
 	}
 
-	client := &wsClient{conn: conn}
+	client := &wsClient{conn: conn, queue: make(chan []byte, 32), done: make(chan struct{})}
+	if len(valid) > 0 {
+		client.valid = valid[0]
+	}
 	h.mu.Lock()
+	if len(h.clients) >= 32 {
+		h.mu.Unlock()
+		conn.Close()
+		return
+	}
 	h.clients[client] = struct{}{}
 	h.mu.Unlock()
 
@@ -154,6 +174,7 @@ func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request, onConnect func(s
 		})
 	}
 
+	go h.writeLoop(client)
 	go h.readLoop(client, rw.Reader)
 }
 
@@ -182,7 +203,10 @@ func readWSFrame(r *bufio.Reader) (opcode byte, payload []byte, err error) {
 	}
 	opcode = b[0] & 0x0f
 	masked := (b[1] & 0x80) != 0
-	length := int64(b[1] & 0x7f)
+	if b[0]&0x70 != 0 || b[0]&0x80 == 0 || !masked || (opcode != 0x1 && opcode != 0x2 && opcode != 0x8 && opcode != 0x9 && opcode != 0xa) {
+		return 0, nil, errors.New("invalid websocket frame")
+	}
+	length := uint64(b[1] & 0x7f)
 
 	switch length {
 	case 126:
@@ -190,15 +214,21 @@ func readWSFrame(r *bufio.Reader) (opcode byte, payload []byte, err error) {
 		if _, err := io.ReadFull(r, ext[:]); err != nil {
 			return 0, nil, err
 		}
-		length = int64(binary.BigEndian.Uint16(ext[:]))
+		length = uint64(binary.BigEndian.Uint16(ext[:]))
+		if length < 126 {
+			return 0, nil, errors.New("noncanonical length")
+		}
 	case 127:
 		var ext [8]byte
 		if _, err := io.ReadFull(r, ext[:]); err != nil {
 			return 0, nil, err
 		}
-		length = int64(binary.BigEndian.Uint64(ext[:]))
+		length = binary.BigEndian.Uint64(ext[:])
+		if length < 65536 {
+			return 0, nil, errors.New("noncanonical length")
+		}
 	}
-	if length > 4*1024*1024 {
+	if length > 4*1024*1024 || (opcode >= 8 && length > 125) {
 		return 0, nil, errors.New("frame too large")
 	}
 
@@ -218,4 +248,46 @@ func readWSFrame(r *bufio.Reader) (opcode byte, payload []byte, err error) {
 		}
 	}
 	return opcode, payload, nil
+}
+
+func headerToken(value, token string) bool {
+	for _, v := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(v), token) {
+			return true
+		}
+	}
+	return false
+}
+func (h *WSHub) Close() {
+	h.mu.RLock()
+	clients := make([]*wsClient, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+	for _, c := range clients {
+		h.remove(c)
+	}
+}
+func (h *WSHub) writeLoop(c *wsClient) {
+	defer h.remove(c)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case payload := <-c.queue:
+			if c.writeText(payload) != nil {
+				return
+			}
+		case <-ticker.C:
+			if c.valid != nil && !c.valid() {
+				return
+			}
+			if c.writeControl(9, nil) != nil {
+				return
+			}
+		}
+	}
 }

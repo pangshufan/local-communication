@@ -6,6 +6,7 @@
     stats: { current_messages: 0, max_messages: 200, current_bytes: 0, max_bytes: 20971520 },
   };
   let messages = [];
+  const renderedCards = new Map();
   let selectedTargetPeerID = ''; // '' = All Devices Public Timeline
   let selectedTargetName = '';
   let countdownTimer = null;
@@ -53,7 +54,7 @@
       case 'darwin': return '🍎 macOS';
       case 'windows': return '🪟 Windows';
       case 'linux': return '🐧 Linux';
-      default: return '📱 ' + (os || 'Device');
+      default: return '📱 Device';
     }
   }
 
@@ -162,11 +163,12 @@
 
   function renderMessages() {
     const filtered = messages.filter((m) => {
-      if (!selectedTargetPeerID) return true;
-      return m.target_peer_id === selectedTargetPeerID || m.sender_id === selectedTargetPeerID;
+      if (!selectedTargetPeerID) return !m.target_peer_id;
+      return (m.target_peer_id === selectedTargetPeerID && m.sender_id === appState.self.peer_id) || (m.target_peer_id === appState.self.peer_id && m.sender_id === selectedTargetPeerID);
     });
 
-    messageStream.querySelectorAll('.msg-card').forEach((el) => el.remove());
+    const visible = new Set(filtered.map(m => m.id));
+    for (const [id, entry] of renderedCards) {if (!visible.has(id)) {entry.card.remove(); renderedCards.delete(id);}}
 
     if (filtered.length === 0) {
       emptyState.style.display = 'block';
@@ -175,9 +177,23 @@
     emptyState.style.display = 'none';
 
     filtered.forEach((m) => {
-      messageStream.appendChild(buildMessageCard(m));
+      const signature = JSON.stringify(m);
+      let entry = renderedCards.get(m.id);
+      if (!entry || entry.signature !== signature) {
+        if (entry) entry.card.remove();
+        entry = {card:buildMessageCard(m), signature}; renderedCards.set(m.id, entry);
+      }
+      messageStream.appendChild(entry.card);
     });
     messageStream.scrollTop = messageStream.scrollHeight;
+  }
+
+  function deliveryHtml(m) {
+    const states = Object.values(m.delivery || {});
+    if (!states.length) return '<span class="delivery">仅保存在本机</span>';
+    const count = states.filter(s => s === 'delivered').length;
+    const failed = states.some(s => s === 'failed');
+    return `<span class="delivery">${failed ? '部分发送失败' : count === states.length ? '已送达' : '发送中'} ${count}/${states.length}</span>${failed ? '<button class="btn btn-sm retry-btn">重试</button>' : ''}`;
   }
 
   function buildMessageCard(m) {
@@ -198,7 +214,7 @@
         </div>
       `;
     } else if (m.kind === 'image') {
-      const imgUrl = m.inline_url || `/api/inline/${m.id}`;
+      const imgUrl = `/api/inline/${encodeURIComponent(m.id)}`;
       bodyHtml = `
         <a href="${imgUrl}" target="_blank" rel="noopener">
           <img class="msg-image" src="${imgUrl}" alt="剪贴板图片" loading="lazy" />
@@ -207,7 +223,8 @@
       `;
     } else if (m.kind === 'file' && m.file) {
       const f = m.file;
-      const dlUrl = f.download_url || `/api/files/stream/${f.file_id}`;
+      const route = f.owner_peer_id === appState.self.peer_id ? 'stream' : 'proxy';
+      const dlUrl = `/api/files/${route}/${encodeURIComponent(f.file_id)}`;
       const shaShort = f.sha256 ? ` · SHA256: ${f.sha256.slice(0, 10)}...` : ' · 本机磁盘零拷贝流';
       bodyHtml = `
         <div class="file-box">
@@ -230,10 +247,13 @@
           ${targetBadge}
         </div>
         <span>${formatTime(m.created_at)}</span>
+        ${isSelf ? deliveryHtml(m) : ''}
       </div>
       ${bodyHtml}
     `;
 
+    const retryBtn = card.querySelector('.retry-btn');
+    if (retryBtn) retryBtn.onclick = async () => { retryBtn.disabled = true; try { const res = await fetch('/api/messages/retry', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:m.id})}); if (!res.ok) alert(await res.text()); } catch { alert('重试失败，请检查连接'); } finally {retryBtn.disabled=false;} };
     const copyBtn = card.querySelector('.copy-btn');
     if (copyBtn) {
       copyBtn.onclick = () => copyToClipboard(m.text, copyBtn);
@@ -277,7 +297,6 @@
   async function sendTextMessage() {
     const text = msgInput.value.trim();
     if (!text) return;
-    msgInput.value = '';
     const res = await fetch('/api/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -290,7 +309,8 @@
     });
     if (!res.ok) {
       alert('发送失败: ' + (await res.text()));
-    }
+    } else {msgInput.value = '';}
+
   }
 
   // Send Inline Clipboard Image (< 2MB) or Fallback to File Upload (> 2MB)
@@ -536,22 +556,9 @@
           <button class="btn btn-primary btn-sm" data-pair-addr="${escapeHtml(n.addr)}">配对</button>
         </div>
       `;
-      row.querySelector('[data-pair-addr]').onclick = async () => {
-        const pin = row.querySelector('[data-pin-for]').value.trim();
-        if (!pin) {
-          alert('请输入对方设备上显示的 6 位配对码');
-          return;
-        }
-        const r = await fetch('/api/peers/pair', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ addr: n.addr, pin }),
-        });
-        if (!r.ok) {
-          alert('配对失败: ' + (await r.text()));
-          return;
-        }
-        closeModal('pairModal');
+      row.querySelector('[data-pair-addr]').onclick = () => {
+        document.getElementById('pairDirectInput').focus();
+        alert('请从目标电脑复制完整配对串 IP:Port#配对码@设备指纹，粘贴到手动配对输入框。扫描结果不能验证设备身份。');
       };
       listEl.appendChild(row);
     });
@@ -576,6 +583,11 @@
       });
     }
   }
+  document.getElementById('revokeMobileBtn').onclick = async () => {
+    if (!confirm('撤销所有手机访问授权？需要重新扫码连接。')) return;
+    const res = await fetch('/api/mobile/revoke', {method:'POST'});
+    if (!res.ok) alert(await res.text()); else loadMobileQR('');
+  };
   document.getElementById('openMobileQRBtn').onclick = () => {
     openModal('mobileModal');
     loadMobileQR('');
@@ -628,19 +640,31 @@
             appState = pkt.data.state || appState;
             messages = pkt.data.messages || [];
             renderState();
+            refreshPairingInfo();
             renderMessages();
             break;
           case 'state_update':
             appState = pkt.data || appState;
             renderState();
+            refreshPairingInfo();
             break;
           case 'stats_update':
-            appState.stats = pkt.data || appState.stats;
+            appState.stats = pkt.data.stats || appState.stats;
+            if (Array.isArray(pkt.data.message_ids)) {
+              const kept = new Set(pkt.data.message_ids);
+              messages = messages.filter(m => kept.has(m.id));
+              renderMessages();
+            }
             renderStats(appState.stats);
+            break;
+          case 'message_delivery':
+            { const m = messages.find(m => m.id === pkt.data.id); if (m) {m.delivery = pkt.data.delivery; renderMessages();} }
             break;
           case 'new_message':
             if (pkt.data && !messages.some((m) => m.id === pkt.data.id)) {
               messages.push(pkt.data);
+              const cap = appState.stats.max_messages || 200;
+              if (messages.length > cap) messages.splice(0, messages.length - cap);
               renderMessages();
               if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
                 new Notification(`LanChat · ${pkt.data.sender_name}`, {
@@ -658,7 +682,9 @@
         console.error(err);
       }
     };
-    ws.onclose = () => {
+    ws.onclose = async () => {
+      activeChannelSub.textContent = '连接已断开，正在重连…';
+      try { const res = await fetch('/api/state'); if (res.status === 401) {activeChannelSub.textContent = '授权已到期或被撤销，请重新扫码'; return;} } catch {}
       setTimeout(connectWS, 2000);
     };
   }
@@ -667,5 +693,22 @@
     window.addEventListener('click', () => Notification.requestPermission(), { once: true });
   }
 
-  connectWS();
+  async function refreshPairingInfo() {
+    const local = ['127.0.0.1','localhost','[::1]'].includes(location.hostname);
+    document.querySelectorAll('[data-host-only]').forEach(el => {el.hidden = !local;});
+    if (!local) return;
+    try {const res = await fetch('/api/pairing-info'); if (res.ok) {const info = await res.json(); Object.assign(appState.discoverable, info); selfPINEl.textContent = info.pin;}} catch {}
+  }
+  async function bootstrap() {
+    const token = new URLSearchParams(location.hash.slice(1)).get('token');
+    if (token) {
+      history.replaceState(null, '', location.pathname);
+      const res = await fetch('/api/session', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})});
+      if (!res.ok) throw new Error('手机授权已失效，请在电脑重新扫码');
+    }
+    const res = await fetch('/api/state');
+    if (!res.ok) throw new Error('此设备尚未授权，请在电脑端扫码连接');
+    appState = await res.json(); renderState(); await refreshPairingInfo(); connectWS();
+  }
+  bootstrap().catch(err => {activeChannelSub.textContent = err.message;});
 })();

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // MessageKind defines the type of message stored in the timeline.
@@ -32,20 +33,21 @@ type FileMeta struct {
 
 // Message represents a chat or file-sharing item in the unified timeline or 1-to-1 channel.
 type Message struct {
-	ID           string      `json:"id"`
-	Kind         MessageKind `json:"kind"`
-	SenderID     string      `json:"sender_id"`
-	SenderName   string      `json:"sender_name"`
-	SenderOS     string      `json:"sender_os"`
-	TargetPeerID string      `json:"target_peer_id,omitempty"` // Empty = All Devices (Public Timeline); non-empty = 1v1 private
-	TargetName   string      `json:"target_name,omitempty"`
-	Text         string      `json:"text,omitempty"`
-	InlineData   []byte      `json:"-"`                        // Raw inline bytes for KindImage (kept in bounded memory pool)
-	InlineMime   string      `json:"inline_mime,omitempty"`    // e.g., image/png
-	InlineURL    string      `json:"inline_url,omitempty"`     // e.g., /api/inline/{id}
-	File         *FileMeta   `json:"file,omitempty"`           // Present when Kind == KindFile
-	CreatedAt    int64       `json:"created_at"`               // Unix milliseconds
-	MemoryBytes  int64       `json:"memory_bytes"`             // Accounted bytes in the ring buffer
+	ID           string            `json:"id"`
+	Kind         MessageKind       `json:"kind"`
+	SenderID     string            `json:"sender_id"`
+	SenderName   string            `json:"sender_name"`
+	SenderOS     string            `json:"sender_os"`
+	TargetPeerID string            `json:"target_peer_id,omitempty"` // Empty = All Devices (Public Timeline); non-empty = 1v1 private
+	TargetName   string            `json:"target_name,omitempty"`
+	Text         string            `json:"text,omitempty"`
+	InlineData   []byte            `json:"-"`                     // Raw inline bytes for KindImage (kept in bounded memory pool)
+	InlineMime   string            `json:"inline_mime,omitempty"` // e.g., image/png
+	InlineURL    string            `json:"inline_url,omitempty"`  // e.g., /api/inline/{id}
+	File         *FileMeta         `json:"file,omitempty"`        // Present when Kind == KindFile
+	CreatedAt    int64             `json:"created_at"`            // Unix milliseconds
+	Delivery     map[string]string `json:"delivery,omitempty"`
+	MemoryBytes  int64             `json:"memory_bytes"` // Accounted bytes in the ring buffer
 }
 
 // Stats reports real-time memory watermark metrics of the in-memory store.
@@ -102,19 +104,51 @@ func NewRingBuffer(maxMessages int, maxBytes int64, maxInlineBytes int64, onEvic
 	}
 }
 
-// computeMessageFootprint estimates the exact RAM occupied by a Message in the ring buffer.
+// computeMessageFootprint accounts for fields plus a conservative registry allowance.
+// This is a storage budget, not a process RSS limit.
 func computeMessageFootprint(m *Message) int64 {
-	const baseStructOverhead = 256
-	size := int64(baseStructOverhead + len(m.ID) + len(m.SenderID) + len(m.SenderName) + len(m.Text) + len(m.InlineData))
-	if m.File != nil {
-		size += int64(128 + len(m.File.FileID) + len(m.File.FileName) + len(m.File.LocalPath) + len(m.File.DownloadURL))
+	size := int64(unsafe.Sizeof(*m)) + 512
+	for _, v := range []string{m.ID, string(m.Kind), m.SenderID, m.SenderName, m.SenderOS, m.TargetPeerID, m.TargetName, m.Text, m.InlineMime, m.InlineURL} {
+		size += int64(len(v))
+	}
+	size += int64(len(m.InlineData)) + int64(len(m.Delivery))*256
+	if f := m.File; f != nil {
+		size += int64(unsafe.Sizeof(*f)) + 256
+		for _, v := range []string{f.FileID, f.FileName, f.MimeType, f.SHA256, f.OwnerPeerID, f.OwnerAddr, f.DownloadURL, f.LocalPath} {
+			size += int64(len(v))
+		}
 	}
 	return size
+}
+
+func cloneMessage(m *Message) *Message {
+	if m == nil {
+		return nil
+	}
+	c := *m
+	c.InlineData = append([]byte(nil), m.InlineData...)
+	if m.File != nil {
+		f := *m.File
+		c.File = &f
+	}
+	if m.Delivery != nil {
+		c.Delivery = make(map[string]string, len(m.Delivery))
+		for k, v := range m.Delivery {
+			c.Delivery[k] = v
+		}
+	}
+	return &c
 }
 
 // Add inserts a message into the ring buffer, evicting oldest entries if needed to stay strictly under watermarks.
 // If the message ID already exists (deduplication across P2P mesh), it returns false without duplicating.
 func (rb *RingBuffer) Add(msg *Message) (added bool, err error) {
+	if msg != nil && len(msg.Delivery) > 64 {
+		return false, ErrPayloadTooLarge
+	}
+	if msg == nil || msg.ID == "" {
+		return false, errors.New("message ID required")
+	}
 	if int64(len(msg.InlineData)) > rb.maxInlineBytes {
 		return false, ErrPayloadTooLarge
 	}
@@ -126,6 +160,7 @@ func (rb *RingBuffer) Add(msg *Message) (added bool, err error) {
 		return false, nil
 	}
 
+	msg = cloneMessage(msg)
 	if msg.CreatedAt == 0 {
 		msg.CreatedAt = time.Now().UnixMilli()
 	}
@@ -163,7 +198,7 @@ func (rb *RingBuffer) evictOldestLocked() {
 	if rb.currentBytes < 0 {
 		rb.currentBytes = 0
 	}
-	oldest.InlineData = nil
+	// Readers own independent snapshots; eviction only releases registry ownership.
 
 	if oldest.File != nil {
 		delete(rb.filesByID, oldest.File.FileID)
@@ -189,7 +224,7 @@ func (rb *RingBuffer) List(localPeerID string) []*Message {
 	out := make([]*Message, 0, len(rb.messages))
 	for _, m := range rb.messages {
 		if m.TargetPeerID == "" || m.TargetPeerID == localPeerID || m.SenderID == localPeerID {
-			out = append(out, m)
+			out = append(out, cloneMessage(m))
 		}
 	}
 	return out
@@ -200,7 +235,7 @@ func (rb *RingBuffer) GetMessage(id string) (*Message, bool) {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 	m, ok := rb.byID[id]
-	return m, ok
+	return cloneMessage(m), ok
 }
 
 // GetFile retrieves file metadata by FileID (used for streaming file downloads).
@@ -208,7 +243,11 @@ func (rb *RingBuffer) GetFile(fileID string) (*FileMeta, bool) {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
 	f, ok := rb.filesByID[fileID]
-	return f, ok
+	if !ok {
+		return nil, false
+	}
+	copy := *f
+	return &copy, true
 }
 
 // Clear wipes all messages and invokes cleanup callbacks for any temporary spooled files.
@@ -242,4 +281,30 @@ func (rb *RingBuffer) Stats() Stats {
 		MaxBytes:        rb.maxBytes,
 		EvictedCount:    rb.evictedCount,
 	}
+}
+
+// SetDelivery updates status only for recipients allocated when the message was accepted.
+func (rb *RingBuffer) SetDelivery(id, peer, status string) bool {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	m, ok := rb.byID[id]
+	if !ok {
+		return false
+	}
+	if _, ok := m.Delivery[peer]; !ok {
+		return false
+	}
+	m.Delivery[peer] = status
+	return true
+}
+
+func (rb *RingBuffer) CanReadFile(fileID, requester, self string) bool {
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+	for _, m := range rb.messages {
+		if m.File != nil && m.File.FileID == fileID {
+			return m.File.OwnerPeerID == self && (m.TargetPeerID == "" || m.TargetPeerID == requester)
+		}
+	}
+	return false
 }

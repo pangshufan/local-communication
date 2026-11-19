@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0" />
   <title>LanChat · 局域网无中心多端互传</title>
   <link rel="manifest" href="/manifest.json" />
   <link rel="stylesheet" href="/style.css" />
@@ -33,7 +33,7 @@
           <span style="color:var(--text-muted)">本机配对码</span>
           <div style="display:flex;align-items:center;gap:6px">
             <span class="mono-tag" id="selfPIN" style="color:#fcd34d;font-weight:700">------</span>
-            <button class="btn btn-sm" id="copyPairUriBtn" title="复制 IP:Port#配对码">复制直连串</button>
+            <button class="btn btn-sm" id="copyPairUriBtn" data-host-only title="复制 IP:Port#配对码@设备指纹">复制直连串</button>
           </div>
         </div>
       </div>
@@ -45,14 +45,14 @@
             <div class="switch-label">允许被局域网扫描发现</div>
             <div class="switch-sub" id="discoverSubText">当前静默：不响应任何公开广播探测</div>
           </div>
-          <button class="toggle-btn" id="toggleDiscoverBtn">已关闭</button>
+          <button class="toggle-btn" id="toggleDiscoverBtn" data-host-only>已关闭</button>
         </div>
       </div>
 
       <!-- Quick Actions -->
       <div class="action-grid">
-        <button class="btn btn-primary" id="openPairModalBtn">➕ 添加电脑</button>
-        <button class="btn" id="openMobileQRBtn">📱 手机扫码</button>
+        <button class="btn btn-primary" id="openPairModalBtn" data-host-only>➕ 添加电脑</button>
+        <button class="btn" id="openMobileQRBtn" data-host-only>📱 手机扫码</button>
       </div>
 
       <!-- Channels & Trusted Devices -->
@@ -67,7 +67,7 @@
       <!-- Memory RingBuffer Watermark Footer -->
       <div class="memory-footer">
         <div style="display:flex;justify-content:space-between;align-items:center">
-          <span style="color:var(--text-muted)">内存池水位 (退出即焚)</span>
+          <span style="color:var(--text-muted)">消息存储预算（非进程内存）</span>
           <span id="memText" style="font-family:monospace">0 KB / 20 MB</span>
         </div>
         <div class="mem-bar-bg">
@@ -77,7 +77,7 @@
           <span style="color:var(--text-muted);font-size:11px" id="msgCountText">0 / 200 条记录</span>
           <div style="display:flex;gap:6px">
             <button class="btn btn-sm btn-danger" id="clearLocalBtn" title="仅清空本机内存记录">清空本机</button>
-            <button class="btn btn-sm btn-danger" id="clearAllBtn" title="同步清空所有已连接设备的内存记录">全端焚毁</button>
+            <button class="btn btn-sm btn-danger" id="clearAllBtn" data-host-only title="同步清空所有已连接设备的内存记录">清空在线设备</button>
           </div>
         </div>
       </div>
@@ -87,7 +87,7 @@
     <main class="chat-main" id="chatMain">
       <div class="drop-overlay" id="dropOverlay">
         <div style="font-size:38px">📂</div>
-        <div style="font-size:18px;font-weight:700">松开鼠标，立即流式直传文件</div>
+        <div style="font-size:18px;font-weight:700">松开鼠标，上传文件到本机临时目录</div>
         <div style="font-size:13px;color:var(--text-muted)">固定 64KB 流式分块传输 · 不占用内存池 · 自动计算 SHA-256</div>
       </div>
 
@@ -122,7 +122,7 @@
           <div class="toolbar-left">
             <input type="file" id="fileInput" multiple style="display:none" />
             <button class="btn btn-sm" id="selectFileBtn">📁 选择文件 / 图片</button>
-            <button class="btn btn-sm" id="localPathBtn" title="本机大文件无需复制上传，直接注册磁盘路径供其他设备拉取">⚡ 本机大文件零拷贝直传</button>
+            <button class="btn btn-sm" id="localPathBtn" data-host-only title="本机大文件无需复制上传，直接注册磁盘路径供其他设备拉取">⚡ 本机大文件路径分享直传</button>
             <span style="font-size:11px;color:var(--text-muted)">💡 支持直接粘贴截图 (Ctrl+V) 或拖拽多文件到窗口</span>
           </div>
         </div>
@@ -149,7 +149,7 @@
       </div>
 
       <div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-        <strong>方式一（完全隐身直连，推荐）</strong>：直接粘贴对方界面左上角的 <span class="mono-tag">IP:Port#配对码</span>，无需任何一方开启广播：
+        <strong>方式一（完全隐身直连，推荐）</strong>：直接粘贴对方界面左上角的 <span class="mono-tag">IP:Port#配对码@设备指纹</span>，无需任何一方开启广播：
       </div>
       <div style="display:flex;gap:8px">
         <input class="input-field" id="pairDirectInput" placeholder="例如 192.168.1.25:52520#839201" />
@@ -182,10 +182,11 @@
         <span>网卡 IP：</span>
         <select id="mobileIpSelect" class="input-field" style="width:auto;padding:4px 8px"></select>
       </div>
+      <button class="btn btn-danger" id="revokeMobileBtn" data-host-only>撤销所有手机授权</button>
       <div class="qr-box" id="qrSvgContainer">正在生成二维码...</div>
       <div class="mono-tag" id="mobileUrlText" style="word-break:break-all;padding:8px"></div>
       <div style="font-size:11px;color:var(--text-muted)">
-        💡 扫码打开后，可在 iOS Safari 或 Android Chrome 点击「添加到主屏幕」，获得与原生 App 一致的全屏体验。
+        首次连接使用 HTTPS 自签名证书，请核对电脑显示的设备身份后信任证书。💡 扫码打开后，可在 iOS Safari 或 Android Chrome 点击「添加到主屏幕」，以浏览器支持的方式快捷打开（不提供离线聊天）。
       </div>
     </div>
   </div>
@@ -194,11 +195,11 @@
   <div class="modal-backdrop" id="localPathModal">
     <div class="modal-card">
       <div class="modal-header">
-        <span>⚡ 本机大文件零拷贝直传</span>
+        <span>⚡ 本机大文件路径分享直传</span>
         <button class="btn btn-sm" data-close="localPathModal">✕</button>
       </div>
       <div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-        输入本机磁盘上的文件绝对路径（哪怕是 50GB 的视频或系统镜像），不会复制文件或占用任何内存，其他设备点击下载时直接从原路径以 64KB 缓冲流式读取：
+        输入本机磁盘上的文件绝对路径（哪怕是 50GB 的视频或系统镜像），不会预先复制文件，下载时仍需网络与读取缓冲，其他设备点击下载时直接从原路径流式读取（原文件需保持可读且内容不变）：
       </div>
       <input class="input-field" id="localFilePathInput" placeholder="例如 /Volumes/T9/movie.mp4 或 C:\Users\me\archive.zip" />
       <div style="display:flex;justify-content:flex-end;gap:8px">

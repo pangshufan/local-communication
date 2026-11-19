@@ -53,6 +53,7 @@ type IdentityManager struct {
 	trustedPeers     map[string]*TrustedPeer
 	discoverableTill time.Time
 	pairingPIN       string
+	pinExpires       time.Time
 }
 
 // LoadOrCreateIdentity initializes the node's identity and loads its trusted device list (if any).
@@ -81,7 +82,7 @@ func LoadOrCreateIdentity(configDir string, customName string) (*IdentityManager
 			pub, err1 := hex.DecodeString(p.PublicKeyHex)
 			priv, err2 := hex.DecodeString(p.PrivateKeyHex)
 			mob, err3 := hex.DecodeString(p.MobileSecret)
-			if err1 == nil && err2 == nil && err3 == nil && len(priv) == ed25519.PrivateKeySize {
+			if err1 == nil && err2 == nil && err3 == nil && len(priv) == ed25519.PrivateKeySize && len(pub) == ed25519.PublicKeySize && len(mob) == 32 && hmac.Equal(priv, ed25519.NewKeyFromSeed(priv[:32])) && hex.EncodeToString(sha256Sum(pub)[:8]) == p.PeerID && ed25519.PrivateKey(priv).Public().(ed25519.PublicKey).Equal(ed25519.PublicKey(pub)) {
 				im.peerID = p.PeerID
 				im.name = p.Name
 				im.pubKey = ed25519.PublicKey(pub)
@@ -89,17 +90,25 @@ func LoadOrCreateIdentity(configDir string, customName string) (*IdentityManager
 				im.mobileSecret = mob
 				if p.TrustedPeers != nil {
 					for k, v := range p.TrustedPeers {
+						if v == nil || k != v.PeerID || !ValidPeerIdentity(v.PeerID, v.PublicKeyHex) || !validSecret(v.SharedKeyHex) {
+							return nil, errors.New("invalid trusted peer in identity file")
+						}
 						v.Online = false
 						im.trustedPeers[k] = v
 					}
 				}
 				if customName != "" && customName != im.name {
 					im.name = customName
-					_ = im.saveLocked()
+					if err := im.saveLocked(); err != nil {
+						return nil, err
+					}
 				}
 				return im, nil
 			}
 		}
+		return nil, errors.New("invalid identity file; restore a backup instead of silently replacing device identity")
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 
 	// Generate fresh identity
@@ -143,7 +152,26 @@ func (im *IdentityManager) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(im.configPath, data, 0600)
+	f, err := os.CreateTemp(filepath.Dir(im.configPath), ".identity-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp, im.configPath)
 }
 
 func (im *IdentityManager) PeerID() string {
@@ -192,8 +220,9 @@ func (im *IdentityManager) SetDiscoverable(enabled bool, duration time.Duration)
 		duration = 3 * time.Minute
 	}
 	im.discoverableTill = time.Now().Add(duration)
-	if im.pairingPIN == "" {
+	if im.pairingPIN == "" || !im.pinExpires.After(time.Now()) {
 		im.pairingPIN = generate6DigitPIN()
+		im.pinExpires = time.Now().Add(3 * time.Minute)
 	}
 	return im.pairingPIN, im.discoverableTill
 }
@@ -204,8 +233,9 @@ func (im *IdentityManager) DiscoverableState() (enabled bool, pin string, remain
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	if im.pairingPIN == "" {
+	if im.pairingPIN == "" || !im.pinExpires.After(time.Now()) {
 		im.pairingPIN = generate6DigitPIN()
+		im.pinExpires = time.Now().Add(3 * time.Minute)
 	}
 	now := time.Now()
 	if im.discoverableTill.After(now) {
@@ -219,6 +249,7 @@ func (im *IdentityManager) RotatePIN() string {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	im.pairingPIN = generate6DigitPIN()
+	im.pinExpires = time.Now().Add(3 * time.Minute)
 	return im.pairingPIN
 }
 
@@ -226,13 +257,13 @@ func (im *IdentityManager) RotatePIN() string {
 func (im *IdentityManager) VerifyPIN(candidate string) bool {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
-	return im.pairingPIN != "" && hmac.Equal([]byte(im.pairingPIN), []byte(candidate))
+	return im.pinExpires.After(time.Now()) && im.pairingPIN != "" && hmac.Equal([]byte(im.pairingPIN), []byte(candidate))
 }
 
 func generate6DigitPIN() string {
 	n, err := rand.Int(rand.Reader, big.NewInt(900000))
 	if err != nil {
-		return "123456"
+		panic("crypto/rand unavailable")
 	}
 	return fmt.Sprintf("%06d", n.Int64()+100000)
 }
@@ -243,6 +274,22 @@ func (im *IdentityManager) AddOrUpdateTrustedPeer(p TrustedPeer) error {
 	defer im.mu.Unlock()
 
 	existing, ok := im.trustedPeers[p.PeerID]
+	if len(p.Name) > 256 || len(p.OS) > 32 || len(p.LastAddr) > 256 {
+		return errors.New("peer fields too long")
+	}
+	if !ok && (len(im.trustedPeers) >= 64 || !ValidPeerIdentity(p.PeerID, p.PublicKeyHex) || !validSecret(p.SharedKeyHex)) {
+		return errors.New("invalid peer identity or device limit reached")
+	}
+	if p.PublicKeyHex != "" && !ValidPeerIdentity(p.PeerID, p.PublicKeyHex) {
+		return errors.New("peer key mismatch")
+	}
+	if p.SharedKeyHex != "" && !validSecret(p.SharedKeyHex) {
+		return errors.New("invalid shared secret")
+	}
+	var previous TrustedPeer
+	if ok {
+		previous = *existing
+	}
 	if ok {
 		if p.Name != "" {
 			existing.Name = p.Name
@@ -268,7 +315,15 @@ func (im *IdentityManager) AddOrUpdateTrustedPeer(p TrustedPeer) error {
 		p.LastSeen = time.Now().UnixMilli()
 		im.trustedPeers[p.PeerID] = &p
 	}
-	return im.saveLocked()
+	if err := im.saveLocked(); err != nil {
+		if ok {
+			*existing = previous
+		} else {
+			delete(im.trustedPeers, p.PeerID)
+		}
+		return err
+	}
+	return nil
 }
 
 // RemoveTrustedPeer unpairs and removes a peer from the trusted list.
@@ -316,50 +371,60 @@ func (im *IdentityManager) GetTrustedPeer(peerID string) (TrustedPeer, bool) {
 	return *p, true
 }
 
-// SignPeerRequest generates an HMAC-SHA256 authentication header for requests sent to a trusted peer.
-func (im *IdentityManager) SignPeerRequest(targetPeerID string, timestampMs int64, bodyHash string) (string, error) {
+// SignPeerRequest binds authentication to the protocol, method, path, nonce and body.
+func (im *IdentityManager) SignPeerRequest(targetPeerID string, timestampMs int64, method, path, nonce, bodyHash string) (string, error) {
 	im.mu.RLock()
+	defer im.mu.RUnlock()
 	peer, ok := im.trustedPeers[targetPeerID]
-	myID := im.peerID
-	im.mu.RUnlock()
-	if !ok || peer.SharedKeyHex == "" {
-		return "", errors.New("unknown or unpaired peer")
+	if !ok || !validSecret(peer.SharedKeyHex) {
+		return "", errors.New("unknown or invalid peer")
 	}
-	key, err := hex.DecodeString(peer.SharedKeyHex)
-	if err != nil {
-		return "", err
-	}
-	mac := hmac.New(sha256.New, key)
-	fmt.Fprintf(mac, "%s:%s:%d:%s", myID, targetPeerID, timestampMs, bodyHash)
-	return hex.EncodeToString(mac.Sum(nil)), nil
+	return requestMAC(peer.SharedKeyHex, im.peerID, targetPeerID, timestampMs, method, path, nonce, bodyHash), nil
 }
 
-// VerifyPeerRequest verifies an incoming P2P request from a trusted peer within a +/- 5 minute clock skew window.
-func (im *IdentityManager) VerifyPeerRequest(senderPeerID string, timestampMs int64, bodyHash string, signatureHex string) bool {
-	diff := time.Now().UnixMilli() - timestampMs
-	if diff < -5*60*1000 || diff > 5*60*1000 {
+func requestMAC(secret, sender, target string, ts int64, method, path, nonce, hash string) string {
+	key, _ := hex.DecodeString(secret)
+	mac := hmac.New(sha256.New, key)
+	fmt.Fprintf(mac, "lanchat-v2\n%s\n%s\n%d\n%s\n%s\n%s\n%s", sender, target, ts, method, path, nonce, hash)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (im *IdentityManager) VerifyPeerRequest(sender string, ts int64, method, path, nonce, hash, sig string) bool {
+	now := time.Now().UnixMilli()
+	if ts < now-60000 || ts > now+60000 || len(nonce) != 32 {
+		return false
+	}
+	if _, err := hex.DecodeString(nonce); err != nil {
 		return false
 	}
 	im.mu.RLock()
-	peer, ok := im.trustedPeers[senderPeerID]
-	myID := im.peerID
-	im.mu.RUnlock()
-	if !ok || peer.SharedKeyHex == "" {
+	defer im.mu.RUnlock()
+	peer, ok := im.trustedPeers[sender]
+	if !ok || !validSecret(peer.SharedKeyHex) {
 		return false
 	}
-	key, err := hex.DecodeString(peer.SharedKeyHex)
-	if err != nil {
-		return false
-	}
-	mac := hmac.New(sha256.New, key)
-	fmt.Fprintf(mac, "%s:%s:%d:%s", senderPeerID, myID, timestampMs, bodyHash)
-	expected := mac.Sum(nil)
-	got, err := hex.DecodeString(signatureHex)
-	if err != nil {
-		return false
-	}
-	return hmac.Equal(expected, got)
+	expected := requestMAC(peer.SharedKeyHex, sender, im.peerID, ts, method, path, nonce, hash)
+	return hmac.Equal([]byte(expected), []byte(sig))
 }
+
+// ConsumePIN prevents concurrent reuse of a successful pairing code.
+func (im *IdentityManager) ConsumePIN(pin string) bool {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	if !im.pinExpires.After(time.Now()) || im.pairingPIN == "" || !hmac.Equal([]byte(pin), []byte(im.pairingPIN)) {
+		return false
+	}
+	im.pairingPIN = ""
+	im.pinExpires = time.Time{}
+	return true
+}
+
+func sha256Sum(b []byte) []byte { h := sha256.Sum256(b); return h[:] }
+func ValidPeerIdentity(id, pubHex string) bool {
+	pub, err := hex.DecodeString(pubHex)
+	return err == nil && len(pub) == ed25519.PublicKeySize && hex.EncodeToString(sha256Sum(pub)[:8]) == id
+}
+func validSecret(s string) bool { b, e := hex.DecodeString(s); return e == nil && len(b) == 32 }
 
 // MakeSilentProbePacket creates an opaque 48-byte UDP packet (`8B random nonce + 8B timestamp + 32B HMAC`)
 // targeted at a specific trusted peer. Untrusted hosts on the LAN see only random noise.
@@ -367,7 +432,7 @@ func (im *IdentityManager) MakeSilentProbePacket(targetPeerID string, myPort int
 	im.mu.RLock()
 	peer, ok := im.trustedPeers[targetPeerID]
 	myID := im.peerID
-	im.mu.RUnlock()
+	defer im.mu.RUnlock()
 	if !ok || peer.SharedKeyHex == "" {
 		return nil, errors.New("peer not trusted")
 	}
@@ -422,7 +487,7 @@ func (im *IdentityManager) MobileAccessToken() string {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
 	mac := hmac.New(sha256.New, im.mobileSecret)
-	mac.Write([]byte("lanchat-mobile-v1:" + im.peerID))
+	mac.Write([]byte(fmt.Sprintf("lanchat-mobile-v2:%s:%d", im.peerID, time.Now().Unix()/3600)))
 	return hex.EncodeToString(mac.Sum(nil))[:24]
 }
 
@@ -431,8 +496,17 @@ func (im *IdentityManager) VerifyMobileToken(token string) bool {
 	if token == "" {
 		return false
 	}
-	expected := im.MobileAccessToken()
-	return hmac.Equal([]byte(expected), []byte(token))
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	for i := int64(0); i < 8; i++ {
+		mac := hmac.New(sha256.New, im.mobileSecret)
+		mac.Write([]byte(fmt.Sprintf("lanchat-mobile-v2:%s:%d", im.peerID, time.Now().Unix()/3600-i)))
+		expected := hex.EncodeToString(mac.Sum(nil))[:24]
+		if hmac.Equal([]byte(expected), []byte(token)) {
+			return true
+		}
+	}
+	return false
 }
 
 // GenerateSharedSecret creates a new 32-byte hex-encoded shared secret during device pairing.
@@ -440,4 +514,28 @@ func GenerateSharedSecret() string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func (im *IdentityManager) RevokeMobile() error {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return err
+	}
+	im.mobileSecret = secret
+	return im.saveLocked()
+}
+
+func (im *IdentityManager) ConfigDir() string { return filepath.Dir(im.configPath) }
+
+func (im *IdentityManager) SignPairing(data []byte) string {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	return hex.EncodeToString(ed25519.Sign(im.privKey, data))
+}
+func VerifyPairing(pubHex string, data []byte, sigHex string) bool {
+	pub, e := hex.DecodeString(pubHex)
+	sig, e2 := hex.DecodeString(sigHex)
+	return e == nil && e2 == nil && len(pub) == ed25519.PublicKeySize && ed25519.Verify(ed25519.PublicKey(pub), data, sig)
 }

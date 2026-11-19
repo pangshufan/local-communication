@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,7 +41,12 @@ func startTestNode(t *testing.T, name string) (*AppServer, *crypto.IdentityManag
 
 	httpSrv := &http.Server{Handler: srv.Handler()}
 	go func() {
-		_ = httpSrv.Serve(ln)
+		cfg, err := im.TLSConfig(nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = httpSrv.Serve(tls.NewListener(ln, cfg))
 	}()
 
 	cleanup := func() {
@@ -56,7 +62,16 @@ func TestTwoNodesPairingChatAndZeroCopyFileStream(t *testing.T) {
 
 	srvB, imB, rbB, portB, cleanB := startTestNode(t, "Node-Linux")
 	defer cleanB()
-	_ = portB
+	clientA, err := crypto.PinnedClient(imA.Fingerprint(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientA.CloseIdleConnections()
+	clientB, err := crypto.PinnedClient(imB.Fingerprint(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientB.CloseIdleConnections()
 
 	// 1. Default stealth mode: verify discoverable is OFF by default
 	enabledA, pinA, _ := imA.DiscoverableState()
@@ -68,7 +83,7 @@ func TestTwoNodesPairingChatAndZeroCopyFileStream(t *testing.T) {
 	}
 
 	// 2. Pair Node B -> Node A using IP:Port#PIN (stealth direct pairing without broadcast)
-	pairURI := fmt.Sprintf("127.0.0.1:%d#%s", portA, pinA)
+	pairURI := fmt.Sprintf("127.0.0.1:%d#%s@%s", portA, pinA, imA.Fingerprint())
 	peerA, err := srvB.mesh.PairWithPeer(pairURI, "")
 	if err != nil {
 		t.Fatalf("PairWithPeer failed: %v", err)
@@ -84,9 +99,9 @@ func TestTwoNodesPairingChatAndZeroCopyFileStream(t *testing.T) {
 
 	// 3. Send a public timeline text message on Node A and verify it arrives in Node B's ring buffer
 	msgBody := []byte(`{"kind":"text","text":"Hello from Mac to Linux!"}`)
-	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/api/messages", portA), bytes.NewReader(msgBody))
+	req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("https://127.0.0.1:%d/api/messages", portA), bytes.NewReader(msgBody))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := clientA.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("post message failed: err=%v status=%v", err, resp)
 	}
@@ -115,7 +130,7 @@ func TestTwoNodesPairingChatAndZeroCopyFileStream(t *testing.T) {
 	regPayload, _ := json.Marshal(map[string]string{
 		"file_path": sampleFile,
 	})
-	regResp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/api/files/register-path", portA), "application/json", bytes.NewReader(regPayload))
+	regResp, err := clientA.Post(fmt.Sprintf("https://127.0.0.1:%d/api/files/register-path", portA), "application/json", bytes.NewReader(regPayload))
 	if err != nil || regResp.StatusCode != http.StatusOK {
 		t.Fatalf("register local path failed: err=%v status=%v", err, regResp)
 	}
@@ -141,8 +156,8 @@ func TestTwoNodesPairingChatAndZeroCopyFileStream(t *testing.T) {
 	}
 
 	// Download the file through Node B's proxy stream endpoint
-	dlURL := fmt.Sprintf("http://127.0.0.1:%d%s", portB, fileMsgB.File.DownloadURL)
-	dlResp, err := http.Get(dlURL)
+	dlURL := fmt.Sprintf("https://127.0.0.1:%d%s", portB, fileMsgB.File.DownloadURL)
+	dlResp, err := clientB.Get(dlURL)
 	if err != nil || dlResp.StatusCode != http.StatusOK {
 		t.Fatalf("proxy stream download failed: err=%v status=%v", err, dlResp)
 	}
@@ -153,7 +168,7 @@ func TestTwoNodesPairingChatAndZeroCopyFileStream(t *testing.T) {
 	}
 
 	// 5. Test All-Devices Memory Burn
-	clearResp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/api/messages/clear", portA), "application/json", bytes.NewReader([]byte(`{"all_devices":true}`)))
+	clearResp, err := clientA.Post(fmt.Sprintf("https://127.0.0.1:%d/api/messages/clear", portA), "application/json", bytes.NewReader([]byte(`{"all_devices":true}`)))
 	if err != nil || clearResp.StatusCode != http.StatusOK {
 		t.Fatalf("clear messages failed: %v", err)
 	}

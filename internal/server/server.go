@@ -38,13 +38,22 @@ var streamBufPool = sync.Pool{
 
 // AppServer serves both the local/mobile WebUI and the P2P HTTP transport endpoints.
 type AppServer struct {
-	identity *crypto.IdentityManager
-	ring     *store.RingBuffer
-	mesh     *p2p.MeshEngine
-	wsHub    *WSHub
-	httpPort int
-	spoolDir string
-	webFS    fs.FS
+	identity       *crypto.IdentityManager
+	ring           *store.RingBuffer
+	mesh           *p2p.MeshEngine
+	wsHub          *WSHub
+	httpPort       int
+	spoolDir       string
+	webFS          fs.FS
+	authMu         sync.Mutex
+	nonces         map[string]time.Time
+	pairWindow     time.Time
+	pairAttempts   int
+	uploads        chan struct{}
+	requests       chan struct{}
+	spoolMu        sync.Mutex
+	MaxUploadBytes int64
+	MaxSpoolBytes  int64
 }
 
 func NewAppServer(
@@ -62,6 +71,7 @@ func NewAppServer(
 		httpPort: httpPort,
 		spoolDir: spoolDir,
 		webFS:    webFS,
+		nonces:   make(map[string]time.Time), uploads: make(chan struct{}, 2), requests: make(chan struct{}, 32), MaxUploadBytes: 1 << 30, MaxSpoolBytes: 2 << 30,
 	}
 	s.mesh = p2p.NewMeshEngine(
 		im,
@@ -70,12 +80,15 @@ func NewAppServer(
 		udpPort,
 		func(msg *store.Message) {
 			s.wsHub.Broadcast("new_message", msg)
-			s.wsHub.Broadcast("stats_update", s.ring.Stats())
+			s.broadcastStats()
 		},
 		func() {
 			s.wsHub.Broadcast("state_update", s.buildStateSnapshot())
 		},
 	)
+	s.mesh.SetDeliveryCallback(func(id string, status map[string]string) {
+		s.wsHub.Broadcast("message_delivery", map[string]any{"id": id, "delivery": status})
+	})
 	return s
 }
 
@@ -85,6 +98,7 @@ func (s *AppServer) StartMesh() error {
 
 func (s *AppServer) Stop() {
 	s.mesh.Stop()
+	s.wsHub.Close()
 	if s.spoolDir != "" {
 		_ = os.RemoveAll(s.spoolDir)
 	}
@@ -100,20 +114,48 @@ func (s *AppServer) Handler() http.Handler {
 				"state":    s.buildStateSnapshot(),
 				"messages": s.decorateMessagesForClient(s.ring.List(s.identity.PeerID()), r.Host),
 			})
-		})
+		}, func() bool { return s.isAuthorizedUIRequest(r) })
 	}))
 
+	mux.HandleFunc("/api/session", s.handleSession)
+	mux.HandleFunc("/api/pairing-info", s.requireLocal(s.handlePairingInfo))
+	mux.HandleFunc("/api/mobile/revoke", s.requireLocal(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if err := s.identity.RevokeMobile(); err != nil {
+			http.Error(w, "save failed", 500)
+			return
+		}
+		s.wsHub.Close()
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	}))
+	mux.HandleFunc("/api/messages/retry", s.requireUIAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var req struct {
+			ID string `json:"id"`
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req) != nil || !s.mesh.RetryMessage(req.ID) {
+			http.Error(w, "message unavailable", 400)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	}))
 	// UI API endpoints
 	mux.HandleFunc("/api/state", s.requireUIAuth(s.handleGetState))
 	mux.HandleFunc("/api/messages", s.requireUIAuth(s.handleMessages))
 	mux.HandleFunc("/api/messages/clear", s.requireUIAuth(s.handleClearMessages))
-	mux.HandleFunc("/api/discoverable", s.requireUIAuth(s.handleSetDiscoverable))
-	mux.HandleFunc("/api/peers/scan", s.requireUIAuth(s.handleScanPeers))
-	mux.HandleFunc("/api/peers/pair", s.requireUIAuth(s.handlePairPeer))
-	mux.HandleFunc("/api/peers/remove", s.requireUIAuth(s.handleRemovePeer))
-	mux.HandleFunc("/api/mobile-qr", s.requireUIAuth(s.handleMobileQR))
+	mux.HandleFunc("/api/discoverable", s.requireLocal(s.handleSetDiscoverable))
+	mux.HandleFunc("/api/peers/scan", s.requireLocal(s.handleScanPeers))
+	mux.HandleFunc("/api/peers/pair", s.requireLocal(s.handlePairPeer))
+	mux.HandleFunc("/api/peers/remove", s.requireLocal(s.handleRemovePeer))
+	mux.HandleFunc("/api/mobile-qr", s.requireLocal(s.handleMobileQR))
 	mux.HandleFunc("/api/files/upload", s.requireUIAuth(s.handleFileUpload))
-	mux.HandleFunc("/api/files/register-path", s.requireUIAuth(s.handleRegisterLocalPath))
+	mux.HandleFunc("/api/files/register-path", s.requireLocal(s.handleRegisterLocalPath))
 
 	// Media & Streaming endpoints (accessible by authorized UI or trusted peers)
 	mux.HandleFunc("/api/inline/", s.handleServeInline)
@@ -129,27 +171,11 @@ func (s *AppServer) Handler() http.Handler {
 	// Static WebUI + PWA assets
 	fileServer := http.FileServer(http.FS(s.webFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// If mobile connects with ?token=..., set persistent HttpOnly cookie and serve UI
-		if tok := r.URL.Query().Get("token"); tok != "" && s.identity.VerifyMobileToken(tok) {
-			http.SetCookie(w, &http.Cookie{
-				Name:     "lanchat_token",
-				Value:    tok,
-				Path:     "/",
-				MaxAge:   30 * 24 * 3600,
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-			})
-		}
-		if !s.isAuthorizedUIRequest(r) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusForbidden)
-			_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LanChat - Private Node</title><style>body{background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}.box{max-width:380px;padding:28px;background:#1e293b;border-radius:16px;border:1px solid #334155}input{width:100%;padding:10px;margin:12px 0;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#fff;box-sizing:border-box}button{width:100%;padding:10px;border-radius:8px;border:0;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer}</style></head><body><div class="box"><h3>🔒 私有节点 (默认隐身)</h3><p style="font-size:14px;color:#94a3b8">此设备仅允许本机或已扫码授权的手机访问。请在电脑端点击「手机连接」扫码，或在下方输入访问令牌：</p><form method="GET" action="/"><input name="token" placeholder="输入访问 Token..." required><button type="submit">验证进入</button></form></div></body></html>`))
-			return
-		}
+
 		fileServer.ServeHTTP(w, r)
 	})
 
-	return mux
+	return s.guard(mux)
 }
 
 func (s *AppServer) isAuthorizedUIRequest(r *http.Request) bool {
@@ -159,9 +185,6 @@ func (s *AppServer) isAuthorizedUIRequest(r *http.Request) bool {
 	}
 	ip := net.ParseIP(host)
 	if ip != nil && ip.IsLoopback() {
-		return true
-	}
-	if tok := r.URL.Query().Get("token"); tok != "" && s.identity.VerifyMobileToken(tok) {
 		return true
 	}
 	if c, err := r.Cookie("lanchat_token"); err == nil && s.identity.VerifyMobileToken(c.Value) {
@@ -197,7 +220,7 @@ func (s *AppServer) requireP2PAuth(next func(w http.ResponseWriter, r *http.Requ
 		}
 
 		// Limit P2P control/inline message body to 4MB max (large files always stream via GET /api/files/stream/)
-		body, err := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
+		body, err := readBody(w, r, 4*1024*1024)
 		if err != nil {
 			http.Error(w, "read body failed", http.StatusBadRequest)
 			return
@@ -205,13 +228,13 @@ func (s *AppServer) requireP2PAuth(next func(w http.ResponseWriter, r *http.Requ
 		sum := sha256.Sum256(body)
 		bodyHash := hex.EncodeToString(sum[:])
 
-		if !s.identity.VerifyPeerRequest(senderID, ts, bodyHash, sig) {
+		if !s.identity.VerifyPeerRequest(senderID, ts, r.Method, r.URL.EscapedPath(), r.Header.Get("X-LanChat-Nonce"), bodyHash, sig) || !s.acceptNonce(senderID, r.Header.Get("X-LanChat-Nonce")) {
 			http.Error(w, "invalid p2p signature", http.StatusForbidden)
 			return
 		}
 
 		// Update peer's latest IP:Port automatically if DHCP changed its IP
-		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && portStr != "" {
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && portStr != "" && validPort(portStr) {
 			s.identity.SetPeerOnline(senderID, net.JoinHostPort(host, portStr), true)
 		}
 		next(w, r, senderID, body)
@@ -219,7 +242,7 @@ func (s *AppServer) requireP2PAuth(next func(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *AppServer) buildStateSnapshot() map[string]any {
-	discEnabled, pin, remSec := s.identity.DiscoverableState()
+	discEnabled, _, remSec := s.identity.DiscoverableState()
 	ips := p2p.GetLANIPs()
 	primaryIP := ips[0]
 	return map[string]any{
@@ -233,11 +256,9 @@ func (s *AppServer) buildStateSnapshot() map[string]any {
 		},
 		"discoverable": map[string]any{
 			"enabled":       discEnabled,
-			"pin":           pin,
 			"remaining_sec": remSec,
-			"pair_uri":      fmt.Sprintf("%s:%d#%s", primaryIP, s.httpPort, pin),
 		},
-		"peers": s.identity.ListTrustedPeers(),
+		"peers": s.publicPeers(),
 		"stats": s.ring.Stats(),
 	}
 }
@@ -261,7 +282,7 @@ func (s *AppServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 			ImageBase64  string            `json:"image_base64"`
 			ImageMime    string            `json:"image_mime"`
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 4*1024*1024)).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4*1024*1024)).Decode(&req); err != nil {
 			http.Error(w, "invalid request JSON", http.StatusBadRequest)
 			return
 		}
@@ -299,13 +320,24 @@ func (s *AppServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if err := validateMessage(msg); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if msg.TargetPeerID != "" {
+			if _, ok := s.identity.GetTrustedPeer(msg.TargetPeerID); !ok {
+				http.Error(w, "unknown recipient", 400)
+				return
+			}
+		}
+		s.mesh.PrepareDelivery(msg)
 		if _, err := s.ring.Add(msg); err != nil {
 			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
 
 		s.wsHub.Broadcast("new_message", msg)
-		s.wsHub.Broadcast("stats_update", s.ring.Stats())
+		s.broadcastStats()
 		s.mesh.PushMessageToPeers(msg)
 		writeJSON(w, http.StatusOK, msg)
 
@@ -324,9 +356,14 @@ func (s *AppServer) handleClearMessages(w http.ResponseWriter, r *http.Request) 
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
+	if req.AllDevices && !isLoopback(r) {
+		http.Error(w, "host management requires local access", 403)
+		return
+	}
 	s.ring.Clear()
 	s.wsHub.Broadcast("clear_messages", nil)
-	s.wsHub.Broadcast("stats_update", s.ring.Stats())
+	s.broadcastStats()
+
 	if req.AllDevices {
 		s.mesh.BroadcastClear()
 	}
@@ -390,7 +427,7 @@ func (s *AppServer) handlePairPeer(w http.ResponseWriter, r *http.Request) {
 	}
 	state := s.buildStateSnapshot()
 	s.wsHub.Broadcast("state_update", state)
-	writeJSON(w, http.StatusOK, map[string]any{"peer": peer, "state": state})
+	writeJSON(w, http.StatusOK, map[string]any{"peer": map[string]string{"peer_id": peer.PeerID, "name": peer.Name}, "state": state})
 }
 
 func (s *AppServer) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
@@ -417,7 +454,17 @@ func (s *AppServer) handleMobileQR(w http.ResponseWriter, r *http.Request) {
 		selectedIP = ips[0]
 	}
 	token := s.identity.MobileAccessToken()
-	mobileURL := fmt.Sprintf("http://%s:%d/?token=%s", selectedIP, s.httpPort, token)
+	valid := false
+	for _, ip := range ips {
+		if selectedIP == ip {
+			valid = true
+		}
+	}
+	if !valid {
+		http.Error(w, "invalid local IP", 400)
+		return
+	}
+	mobileURL := fmt.Sprintf("https://%s:%d/#token=%s", selectedIP, s.httpPort, token)
 	svg, err := qrcode.RenderSVG(mobileURL)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -448,7 +495,7 @@ func (s *AppServer) handleRegisterLocalPath(w http.ResponseWriter, r *http.Reque
 	}
 	cleanPath := filepath.Clean(strings.TrimSpace(req.FilePath))
 	info, err := os.Stat(cleanPath)
-	if err != nil || info.IsDir() {
+	if err != nil || !info.Mode().IsRegular() {
 		http.Error(w, "file not found or is a directory", http.StatusBadRequest)
 		return
 	}
@@ -483,12 +530,23 @@ func (s *AppServer) handleRegisterLocalPath(w http.ResponseWriter, r *http.Reque
 		File:         meta,
 		CreatedAt:    time.Now().UnixMilli(),
 	}
+	if err := validateMessage(msg); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if msg.TargetPeerID != "" {
+		if _, ok := s.identity.GetTrustedPeer(msg.TargetPeerID); !ok {
+			http.Error(w, "unknown recipient", 400)
+			return
+		}
+	}
+	s.mesh.PrepareDelivery(msg)
 	if _, err := s.ring.Add(msg); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.wsHub.Broadcast("new_message", msg)
-	s.wsHub.Broadcast("stats_update", s.ring.Stats())
+	s.broadcastStats()
 	s.mesh.PushMessageToPeers(msg)
 	writeJSON(w, http.StatusOK, msg)
 }
@@ -500,6 +558,12 @@ func (s *AppServer) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	free, ok := s.beginUpload(w, r)
+	if !ok {
+		return
+	}
+	defer func() { s.spoolMu.Unlock(); <-s.uploads }()
+	r.Body = http.MaxBytesReader(w, r.Body, s.MaxUploadBytes+1024*1024)
 	mr, err := r.MultipartReader()
 	if err != nil {
 		http.Error(w, "expected multipart/form-data", http.StatusBadRequest)
@@ -507,6 +571,8 @@ func (s *AppServer) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var targetPeerID, targetName string
+	targetDeclared := false
+	fileCount := 0
 	var createdMsgs []*store.Message
 
 	if err := os.MkdirAll(s.spoolDir, 0700); err != nil {
@@ -525,6 +591,11 @@ func (s *AppServer) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		formName := part.FormName()
 		if formName == "target_peer_id" {
+			if targetDeclared || fileCount > 0 {
+				http.Error(w, "recipient must be declared once before files", 400)
+				return
+			}
+			targetDeclared = true
 			b, _ := io.ReadAll(io.LimitReader(part, 256))
 			targetPeerID = strings.TrimSpace(string(b))
 			_ = part.Close()
@@ -535,6 +606,15 @@ func (s *AppServer) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 			targetName = strings.TrimSpace(string(b))
 			_ = part.Close()
 			continue
+		}
+		if !targetDeclared {
+			http.Error(w, "declare target_peer_id before files (empty for public)", 400)
+			return
+		}
+		fileCount++
+		if fileCount > 64 {
+			http.Error(w, "too many files", 413)
+			return
 		}
 		fileName := filepath.Base(part.FileName())
 		if fileName == "" || fileName == "." {
@@ -553,14 +633,19 @@ func (s *AppServer) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 
 		hasher := sha256.New()
 		bufPtr := streamBufPool.Get().(*[]byte)
-		written, copyErr := io.CopyBuffer(io.MultiWriter(outFile, hasher), part, *bufPtr)
+		quota := &quotaWriter{w: io.MultiWriter(outFile, hasher), remaining: free}
+		written, copyErr := io.CopyBuffer(quota, part, *bufPtr)
+		free -= written
 		streamBufPool.Put(bufPtr)
-		_ = outFile.Close()
+		closeErr := outFile.Close()
+		if copyErr == nil {
+			copyErr = closeErr
+		}
 		_ = part.Close()
 
 		if copyErr != nil {
 			_ = os.Remove(spoolPath)
-			http.Error(w, "stream upload failed: "+copyErr.Error(), http.StatusInternalServerError)
+			http.Error(w, "stream upload failed: "+copyErr.Error(), http.StatusRequestEntityTooLarge)
 			return
 		}
 
@@ -597,16 +682,31 @@ func (s *AppServer) handleFileUpload(w http.ResponseWriter, r *http.Request) {
 			File:         meta,
 			CreatedAt:    time.Now().UnixMilli(),
 		}
+		if targetPeerID != "" {
+			if _, ok := s.identity.GetTrustedPeer(targetPeerID); !ok {
+				os.Remove(spoolPath)
+				http.Error(w, "unknown recipient", 400)
+				return
+			}
+		}
+		if err := validateMessage(msg); err != nil {
+			os.Remove(spoolPath)
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		s.mesh.PrepareDelivery(msg)
 		if _, err := s.ring.Add(msg); err == nil {
 			createdMsgs = append(createdMsgs, msg)
 			s.wsHub.Broadcast("new_message", msg)
 			s.mesh.PushMessageToPeers(msg)
 		} else {
 			_ = os.Remove(spoolPath)
+			http.Error(w, "message storage quota exceeded", 413)
+			return
 		}
 	}
 
-	s.wsHub.Broadcast("stats_update", s.ring.Stats())
+	s.broadcastStats()
 	writeJSON(w, http.StatusOK, map[string]any{"messages": createdMsgs})
 }
 
@@ -622,7 +722,7 @@ func (s *AppServer) handleServeInline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", msg.InlineMime)
-	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(msg.InlineData)
 }
 
@@ -677,13 +777,15 @@ func (s *AppServer) handleProxyRemoteFile(w http.ResponseWriter, r *http.Request
 	}
 
 	ts := time.Now().UnixMilli()
-	sig, err := s.identity.SignPeerRequest(meta.OwnerPeerID, ts, fileID)
+	nonce := crypto.GenerateSharedSecret()[:32]
+	path := "/api/files/stream/" + fileID
+	sig, err := s.identity.SignPeerRequest(meta.OwnerPeerID, ts, http.MethodGet, path, nonce, fileID)
 	if err != nil {
 		http.Error(w, "untrusted file owner", http.StatusForbidden)
 		return
 	}
 
-	remoteURL := fmt.Sprintf("http://%s/api/files/stream/%s", addr, fileID)
+	remoteURL := fmt.Sprintf("https://%s/api/files/stream/%s", addr, fileID)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, remoteURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -692,11 +794,18 @@ func (s *AppServer) handleProxyRemoteFile(w http.ResponseWriter, r *http.Request
 	req.Header.Set("X-LanChat-Peer", s.identity.PeerID())
 	req.Header.Set("X-LanChat-Ts", strconv.FormatInt(ts, 10))
 	req.Header.Set("X-LanChat-Sig", sig)
+	req.Header.Set("X-LanChat-Nonce", nonce)
 	if rng := r.Header.Get("Range"); rng != "" {
 		req.Header.Set("Range", rng)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client, err := s.identity.PeerClient(meta.OwnerPeerID, 0)
+	if err != nil {
+		http.Error(w, "untrusted owner", 403)
+		return
+	}
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "remote node unreachable: "+err.Error(), http.StatusBadGateway)
 		return
@@ -724,7 +833,8 @@ func (s *AppServer) isAuthorizedPeerStream(r *http.Request) bool {
 	if err != nil || senderID == "" || sig == "" {
 		return false
 	}
-	return s.identity.VerifyPeerRequest(senderID, ts, fileID, sig)
+	nonce := r.Header.Get("X-LanChat-Nonce")
+	return s.identity.VerifyPeerRequest(senderID, ts, r.Method, r.URL.EscapedPath(), nonce, fileID, sig) && s.acceptNonce(senderID, nonce) && s.ring.CanReadFile(fileID, senderID, s.identity.PeerID())
 }
 
 // --- P2P Protocol Handlers ---
@@ -734,12 +844,32 @@ func (s *AppServer) handleP2PPair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.allowPairAttempt() {
+		http.Error(w, "pairing rate limit; wait one minute", 429)
+		return
+	}
 	var req p2p.PairRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&req); err != nil {
 		http.Error(w, "invalid pair request", http.StatusBadRequest)
 		return
 	}
-	if !s.identity.VerifyPIN(req.PIN) {
+	signature := req.Signature
+	req.Signature = ""
+	proof, _ := json.Marshal(req)
+	if !crypto.VerifyPairing(req.PublicKeyHex, proof, signature) {
+		http.Error(w, "invalid device proof", 403)
+		return
+	}
+	secret, e := hex.DecodeString(req.SharedKeyHex)
+	if !crypto.ValidPeerIdentity(req.PeerID, req.PublicKeyHex) || e != nil || len(secret) != 32 || req.HTTPPort < 1 || req.HTTPPort > 65535 || len(req.Name) > 256 || len(req.OS) > 32 {
+		http.Error(w, "invalid peer identity", 400)
+		return
+	}
+	if len(s.identity.ListTrustedPeers()) >= 64 {
+		http.Error(w, "trusted device limit reached", 409)
+		return
+	}
+	if !s.identity.ConsumePIN(req.PIN) {
 		http.Error(w, "invalid or expired 6-digit pairing PIN", http.StatusForbidden)
 		return
 	}
@@ -785,7 +915,11 @@ func (s *AppServer) handleP2PPing(w http.ResponseWriter, r *http.Request, sender
 		OS       string `json:"os"`
 		HTTPPort int    `json:"http_port"`
 	}
-	if json.Unmarshal(body, &ping) == nil && ping.HTTPPort > 0 {
+	if json.Unmarshal(body, &ping) != nil || ping.HTTPPort < 1 || ping.HTTPPort > 65535 || len(ping.Name) > 256 || len(ping.OS) > 32 {
+		http.Error(w, "invalid ping", 400)
+		return
+	}
+	if ping.HTTPPort > 0 {
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 			_ = s.identity.AddOrUpdateTrustedPeer(crypto.TrustedPeer{
 				PeerID:   senderPeerID,
@@ -806,6 +940,14 @@ func (s *AppServer) handleP2PMessage(w http.ResponseWriter, r *http.Request, sen
 		return
 	}
 	msg := wire.Message
+	if msg.SenderID != senderPeerID || (msg.TargetPeerID != "" && msg.TargetPeerID != s.identity.PeerID()) {
+		http.Error(w, "sender or recipient mismatch", 403)
+		return
+	}
+	msg.Delivery = nil
+	peer, _ := s.identity.GetTrustedPeer(senderPeerID)
+	msg.SenderName = peer.Name
+	msg.SenderOS = peer.OS
 	if msg.Kind == store.KindImage && wire.InlineDataBase64 != "" {
 		if raw, err := base64.StdEncoding.DecodeString(wire.InlineDataBase64); err == nil {
 			msg.InlineData = raw
@@ -813,14 +955,22 @@ func (s *AppServer) handleP2PMessage(w http.ResponseWriter, r *http.Request, sen
 		}
 	}
 	if msg.Kind == store.KindFile && msg.File != nil {
+		if msg.File.OwnerPeerID != senderPeerID {
+			http.Error(w, "file owner mismatch", 403)
+			return
+		}
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			if portStr := r.Header.Get("X-LanChat-Port"); portStr != "" {
+			if portStr := r.Header.Get("X-LanChat-Port"); validPort(portStr) {
 				msg.File.OwnerAddr = net.JoinHostPort(host, portStr)
 			}
 		}
 		msg.File.DownloadURL = "/api/files/proxy/" + msg.File.FileID
 	}
 
+	if err := validateMessage(msg); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	added, err := s.ring.Add(msg)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
@@ -828,7 +978,7 @@ func (s *AppServer) handleP2PMessage(w http.ResponseWriter, r *http.Request, sen
 	}
 	if added {
 		s.wsHub.Broadcast("new_message", msg)
-		s.wsHub.Broadcast("stats_update", s.ring.Stats())
+		s.broadcastStats()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"added": added})
 }
@@ -836,7 +986,7 @@ func (s *AppServer) handleP2PMessage(w http.ResponseWriter, r *http.Request, sen
 func (s *AppServer) handleP2PClear(w http.ResponseWriter, r *http.Request, senderPeerID string, body []byte) {
 	s.ring.Clear()
 	s.wsHub.Broadcast("clear_messages", nil)
-	s.wsHub.Broadcast("stats_update", s.ring.Stats())
+	s.broadcastStats()
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": true})
 }
 
@@ -847,7 +997,7 @@ func (s *AppServer) decorateMessagesForClient(msgs []*store.Message, host string
 func generateID(prefix string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
-	return fmt.Sprintf("%s_%d_%s", prefix, time.Now().UnixMilli(), hex.EncodeToString(b[:4]))
+	return fmt.Sprintf("%s_%d_%s", prefix, time.Now().UnixMilli(), hex.EncodeToString(b[:]))
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

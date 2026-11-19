@@ -7,7 +7,7 @@ import (
 
 func TestRingBufferCountAndByteEviction(t *testing.T) {
 	var evictedFiles []string
-	rb := NewRingBuffer(5, 4096, 2048, func(meta *FileMeta) {
+	rb := NewRingBuffer(5, 8192, 2048, func(meta *FileMeta) {
 		evictedFiles = append(evictedFiles, meta.FileID)
 	})
 
@@ -40,6 +40,7 @@ func TestRingBufferCountAndByteEviction(t *testing.T) {
 	}
 
 	// 2. Test byte watermark eviction (add 2 messages with 1.5KB inline image each into 4KB max pool)
+	rb = NewRingBuffer(5, 4096, 2048, func(meta *FileMeta) { evictedFiles = append(evictedFiles, meta.FileID) })
 	payload := make([]byte, 1500)
 	for i := 1; i <= 3; i++ {
 		_, err := rb.Add(&Message{
@@ -75,5 +76,24 @@ func TestRingBufferCountAndByteEviction(t *testing.T) {
 		InlineData: tooBig,
 	}); err != ErrPayloadTooLarge {
 		t.Fatalf("expected ErrPayloadTooLarge, got %v", err)
+	}
+}
+
+func TestSnapshotsDoNotShareMutableMemory(t *testing.T) {
+	rb := NewRingBuffer(2, 1<<20, 1<<16, nil)
+	original := &Message{ID: "copy", InlineData: []byte("abc"), File: &FileMeta{FileID: "file", FileName: "original"}, Delivery: map[string]string{"peer": "pending"}}
+	rb.Add(original)
+	original.InlineData[0] = 'z'
+	original.File.FileName = "changed"
+	original.Delivery["peer"] = "changed"
+	snapshot, _ := rb.GetMessage("copy")
+	if string(snapshot.InlineData) != "abc" || snapshot.File.FileName != "original" || snapshot.Delivery["peer"] != "pending" {
+		t.Fatal("store retained caller-owned mutable fields")
+	}
+	snapshot.InlineData[0] = 'x'
+	snapshot.File.FileName = "bad"
+	rb.Clear()
+	if string(snapshot.InlineData) != "xbc" {
+		t.Fatal("clear mutated reader snapshot")
 	}
 }
