@@ -97,3 +97,14 @@ func TestSnapshotsDoNotShareMutableMemory(t *testing.T) {
 		t.Fatal("clear mutated reader snapshot")
 	}
 }
+
+func TestFileIDsCannotReplaceOtherFiles(t *testing.T) {
+	rb := NewRingBuffer(10, 1<<20, 1<<16, nil)
+	rb.Add(&Message{ID: "a", File: &FileMeta{FileID: "same", FileName: "original"}})
+	if _, e := rb.Add(&Message{ID: "b", File: &FileMeta{FileID: "same", FileName: "replacement"}}); e == nil {
+		t.Fatal("file ID collision accepted")
+	}
+	if f, _ := rb.GetFile("same"); f.FileName != "original" {
+		t.Fatal("original file replaced")
+	}
+}

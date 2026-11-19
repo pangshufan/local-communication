@@ -155,3 +155,24 @@ func TestTLSRejectsWrongDeviceAndPlaintext(t *testing.T) {
 		t.Fatal("TLS minimum weakened")
 	}
 }
+
+func TestSilentProbeAuthenticationAndReplay(t *testing.T) {
+	a, b := testIdentity(t), testIdentity(t)
+	trust(t, a, b)
+	packet, e := a.MakeSilentProbePacket(b.PeerID(), 52520)
+	if e != nil {
+		t.Fatal(e)
+	}
+	tampered := append([]byte(nil), packet...)
+	tampered[0] ^= 1
+	if _, _, ok := b.VerifySilentProbePacket(tampered); ok {
+		t.Fatal("tampered probe accepted")
+	}
+	id, port, ok := b.VerifySilentProbePacket(packet)
+	if !ok || id != a.PeerID() || port != 52520 {
+		t.Fatal("valid probe rejected")
+	}
+	if _, _, ok := b.VerifySilentProbePacket(packet); ok {
+		t.Fatal("probe replay accepted")
+	}
+}

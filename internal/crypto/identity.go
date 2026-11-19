@@ -54,6 +54,7 @@ type IdentityManager struct {
 	discoverableTill time.Time
 	pairingPIN       string
 	pinExpires       time.Time
+	seenProbes       map[[32]byte]time.Time
 }
 
 // LoadOrCreateIdentity initializes the node's identity and loads its trusted device list (if any).
@@ -426,7 +427,7 @@ func ValidPeerIdentity(id, pubHex string) bool {
 }
 func validSecret(s string) bool { b, e := hex.DecodeString(s); return e == nil && len(b) == 32 }
 
-// MakeSilentProbePacket creates an opaque 48-byte UDP packet (`8B random nonce + 8B timestamp + 32B HMAC`)
+// MakeSilentProbePacket creates an opaque 50-byte UDP packet (nonce, timestamp, port and HMAC)
 // targeted at a specific trusted peer. Untrusted hosts on the LAN see only random noise.
 func (im *IdentityManager) MakeSilentProbePacket(targetPeerID string, myPort int) ([]byte, error) {
 	im.mu.RLock()
@@ -459,13 +460,13 @@ func (im *IdentityManager) VerifySilentProbePacket(pkt []byte) (senderPeerID str
 	}
 	ts := int64(binary.BigEndian.Uint64(pkt[8:16]))
 	now := time.Now().Unix()
-	if now-ts > 60 || ts-now > 60 {
+	if ts < now-60 || ts > now+60 {
 		return "", 0, false
 	}
 	port := int(binary.BigEndian.Uint16(pkt[16:18]))
 
-	im.mu.RLock()
-	defer im.mu.RUnlock()
+	im.mu.Lock()
+	defer im.mu.Unlock()
 
 	for pid, peer := range im.trustedPeers {
 		key, err := hex.DecodeString(peer.SharedKeyHex)
@@ -476,6 +477,22 @@ func (im *IdentityManager) VerifySilentProbePacket(pkt []byte) (senderPeerID str
 		mac.Write(pkt[:18])
 		mac.Write([]byte(pid + "->" + im.peerID))
 		if hmac.Equal(pkt[18:], mac.Sum(nil)) {
+			if port < 1 {
+				return "", 0, false
+			}
+			if im.seenProbes == nil {
+				im.seenProbes = make(map[[32]byte]time.Time)
+			}
+			for k, expiry := range im.seenProbes {
+				if !expiry.After(time.Now()) {
+					delete(im.seenProbes, k)
+				}
+			}
+			key := sha256.Sum256(pkt)
+			if _, seen := im.seenProbes[key]; seen || len(im.seenProbes) >= 4096 {
+				return "", 0, false
+			}
+			im.seenProbes[key] = time.Now().Add(121 * time.Second)
 			return pid, port, true
 		}
 	}

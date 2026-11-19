@@ -454,7 +454,8 @@
     }
   };
 
-  copyPairUriBtn.onclick = () => {
+  copyPairUriBtn.onclick = async () => {
+    await refreshPairingInfo();
     if (appState.discoverable && appState.discoverable.pair_uri) {
       copyToClipboard(appState.discoverable.pair_uri, copyPairUriBtn);
     }

@@ -160,6 +160,11 @@ func (rb *RingBuffer) Add(msg *Message) (added bool, err error) {
 		return false, nil
 	}
 
+	if msg.File != nil && msg.File.FileID != "" {
+		if _, exists := rb.filesByID[msg.File.FileID]; exists {
+			return false, errors.New("duplicate file ID")
+		}
+	}
 	msg = cloneMessage(msg)
 	if msg.CreatedAt == 0 {
 		msg.CreatedAt = time.Now().UnixMilli()
@@ -292,6 +297,9 @@ func (rb *RingBuffer) SetDelivery(id, peer, status string) bool {
 		return false
 	}
 	if _, ok := m.Delivery[peer]; !ok {
+		return false
+	}
+	if m.Delivery[peer] == "delivered" && status != "delivered" {
 		return false
 	}
 	m.Delivery[peer] = status

@@ -74,6 +74,7 @@ type MeshEngine struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	jobs         chan deliveryJob
+	probes       chan struct{}
 	onDelivery   func(string, map[string]string)
 	stopOnce     sync.Once
 	wg           sync.WaitGroup
@@ -92,7 +93,7 @@ func NewMeshEngine(
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MeshEngine{
-		ctx: ctx, cancel: cancel, jobs: make(chan deliveryJob, 256),
+		ctx: ctx, cancel: cancel, jobs: make(chan deliveryJob, 256), probes: make(chan struct{}, 4),
 		identity:     im,
 		ring:         rb,
 		httpPort:     httpPort,
@@ -154,12 +155,22 @@ func (m *MeshEngine) udpListenLoop() {
 		if n == 50 {
 			if senderPeerID, senderHTTPPort, ok := m.identity.VerifySilentProbePacket(pkt); ok {
 				peerAddr := fmt.Sprintf("%s:%d", remoteAddr.IP.String(), senderHTTPPort)
-				m.identity.SetPeerOnline(senderPeerID, peerAddr, true)
-				if m.onPeerChange != nil {
-					m.onPeerChange()
+				select {
+				case m.probes <- struct{}{}:
+					m.wg.Add(1)
+					go func(id, addr string) {
+						defer m.wg.Done()
+						defer func() { <-m.probes }()
+						if m.pingTrustedPeer(id, addr) {
+							m.retryFailed(id)
+							if m.onPeerChange != nil {
+								m.onPeerChange()
+							}
+						}
+					}(senderPeerID, peerAddr)
+				default:
 				}
-				// Trigger an immediate signed ping back so the probing peer learns our current IP:Port
-				go m.pingTrustedPeer(senderPeerID, peerAddr)
+
 			}
 			continue
 		}
@@ -658,3 +669,5 @@ func getBroadcastAddrs(port int) []*net.UDPAddr {
 	}
 	return out
 }
+
+func (m *MeshEngine) PeerAvailable(peerID string) { m.retryFailed(peerID) }

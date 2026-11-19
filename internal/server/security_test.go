@@ -227,3 +227,36 @@ func TestStaleSpoolCleanup(t *testing.T) {
 		t.Fatal("current session not cleaned")
 	}
 }
+
+func TestUploadSpoolDownloadRangeAndClear(t *testing.T) {
+	s, _, rb := boundaryServer(t)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	mw.WriteField("target_peer_id", "")
+	p, _ := mw.CreateFormFile("file", "sample.bin")
+	p.Write([]byte("sample-content"))
+	mw.Close()
+	w := request(t, s, "POST", "/api/files/upload", body.Bytes(), false, map[string]string{"Content-Type": mw.FormDataContentType()})
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	var result struct {
+		Messages []*store.Message `json:"messages"`
+	}
+	if e := json.Unmarshal(w.Body.Bytes(), &result); e != nil || len(result.Messages) != 1 {
+		t.Fatal("missing file message", e)
+	}
+	file := result.Messages[0].File
+	if file.SHA256 != bodyHash([]byte("sample-content")) {
+		t.Fatal("incorrect SHA256")
+	}
+	dl := request(t, s, "GET", file.DownloadURL, nil, false, map[string]string{"Range": "bytes=0-5"})
+	if dl.Code != 206 || dl.Body.String() != "sample" {
+		t.Fatal("range download failed", dl.Code, dl.Body.String())
+	}
+	rb.Clear()
+	entries, _ := os.ReadDir(s.spoolDir)
+	if len(entries) != 0 {
+		t.Fatal("clear left spool file")
+	}
+}

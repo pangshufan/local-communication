@@ -29,7 +29,8 @@ jobs:
       - name: Static checks
         run: go vet ./...
       - name: Race and integration tests
-        run: go test -race -count=1 -timeout=120s -coverprofile=coverage.out ./...
+        shell: bash
+        run: go test -race -count=1 -timeout=120s '-coverprofile=coverage.out' ./...
       - name: Frontend regression tests
         run: node --test internal/web/frontend.test.cjs
       - name: Format check

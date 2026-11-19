@@ -235,7 +235,11 @@ func (s *AppServer) requireP2PAuth(next func(w http.ResponseWriter, r *http.Requ
 
 		// Update peer's latest IP:Port automatically if DHCP changed its IP
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && portStr != "" && validPort(portStr) {
+			peer, _ := s.identity.GetTrustedPeer(senderID)
 			s.identity.SetPeerOnline(senderID, net.JoinHostPort(host, portStr), true)
+			if !peer.Online {
+				s.mesh.PeerAvailable(senderID)
+			}
 		}
 		next(w, r, senderID, body)
 	}
