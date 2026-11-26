@@ -69,8 +69,9 @@ func (c *wsClient) writeControl(opcode byte, payload []byte) error {
 
 // WSHub manages active WebSocket connections for real-time UI updates.
 type WSHub struct {
-	mu      sync.RWMutex
-	clients map[*wsClient]struct{}
+	mu       sync.RWMutex
+	clients  map[*wsClient]struct{}
+	stopping bool
 }
 
 func NewWSHub() *WSHub {
@@ -158,7 +159,7 @@ func (h *WSHub) ServeWS(w http.ResponseWriter, r *http.Request, onConnect func(s
 		client.valid = valid[0]
 	}
 	h.mu.Lock()
-	if len(h.clients) >= 32 {
+	if h.stopping || len(h.clients) >= 32 {
 		h.mu.Unlock()
 		conn.Close()
 		return
@@ -289,5 +290,36 @@ func (h *WSHub) writeLoop(c *wsClient) {
 				return
 			}
 		}
+	}
+}
+
+// Shutdown tells browsers this server is going away, then bounds the grace
+// period so a blocked WebSocket cannot hold up process exit.
+func (h *WSHub) Shutdown() {
+	h.mu.Lock()
+	h.stopping = true
+	clients := make([]*wsClient, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, c := range clients {
+		wg.Add(1)
+		go func(c *wsClient) {
+			defer wg.Done()
+			_ = c.writeControl(8, append([]byte{0x03, 0xe9}, []byte("server shutdown")...))
+			h.remove(c)
+		}(c)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		h.Close()
+		<-done
 	}
 }

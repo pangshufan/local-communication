@@ -28,7 +28,7 @@ import (
 
 func main() {
 	var (
-		port        = flag.Int("port", 52520, "HTTP/WebUI & P2P listen port (0 for random available port)")
+		port        = flag.Int("port", p2p.DefaultHTTPPort, "HTTP/WebUI & P2P listen port (0 for random available port)")
 		udpPort     = flag.Int("udp-port", p2p.DefaultUDPPort, "UDP port for opt-in discovery & silent HMAC probes")
 		deviceName  = flag.String("name", "", "Custom device display name (default: Hostname + OS)")
 		maxMsgs     = flag.Int("max-msgs", 200, "Maximum number of messages kept in memory ring buffer")
@@ -41,7 +41,7 @@ func main() {
 		configDir   = flag.String("config-dir", "", "Directory to store device identity & trusted peer keys")
 	)
 	flag.Parse()
-	if *port < 0 || *port > 65535 || *maxMsgs < 1 || *maxMsgs > 10000 || *maxMemMB < 1 || *maxMemMB > 4096 || *maxUploadMB < 1 || *maxUploadMB > 1048576 || *maxSpoolMB < *maxUploadMB || *maxSpoolMB > 1048576 {
+	if *port < 0 || *port > 65535 || *udpPort < 1 || *udpPort > 65535 || *maxMsgs < 1 || *maxMsgs > 10000 || *maxMemMB < 1 || *maxMemMB > 4096 || *maxUploadMB < 1 || *maxUploadMB > 1048576 || *maxSpoolMB < *maxUploadMB || *maxSpoolMB > 1048576 {
 		fmt.Fprintln(os.Stderr, "invalid port or resource limits")
 		os.Exit(2)
 	}
@@ -67,13 +67,14 @@ func main() {
 		}
 	})
 
-	// Bind TCP listener (if default port 52520 is busy, automatically fall back to a free port)
+	// Automatic fallback uses registered ports; --port 0 explicitly opts into an OS-assigned port.
 	ln, actualPort, err := listenTCPWithFallback(*port)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to bind TCP port: %v\n", err)
 		os.Exit(1)
 	}
 
+	defer ln.Close()
 	staticFS, err := web.StaticFS()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to load embedded WebUI: %v\n", err)
@@ -88,7 +89,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		return
 	}
-	localLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	localLn, err := listenRegisteredTCP("127.0.0.1", p2p.DefaultHTTPPort+1)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -140,24 +141,47 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
-	fmt.Println("\n🧹 正在退出并销毁所有内存消息与临时文件句柄...")
+	fmt.Println("\n🧹 正在停止通信并清理消息与临时文件...")
+	appSrv.BeginShutdown()
+	shutdownHTTPServers(2*time.Second, localSrv, httpSrv)
+	appSrv.Stop()
 	ring.Clear()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = localSrv.Shutdown(ctx)
-	_ = httpSrv.Shutdown(ctx)
 }
 
 func listenTCPWithFallback(preferredPort int) (net.Listener, int, error) {
 	ln, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", preferredPort))
 	if err != nil && preferredPort != 0 {
-		ln, err = net.Listen("tcp4", "0.0.0.0:0")
+		ln, err = listenRegisteredTCP("0.0.0.0", p2p.DefaultHTTPPort)
 	}
 	if err != nil {
 		return nil, 0, err
 	}
 	addr := ln.Addr().(*net.TCPAddr)
 	return ln, addr.Port, nil
+}
+
+// Keep automatic listeners below 32768. Explicit --port 0 remains available.
+func listenRegisteredTCP(host string, start int) (net.Listener, error) {
+	var last error
+	for port := start; port < 32768; port++ {
+		ln, err := net.Listen("tcp4", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err == nil {
+			return ln, nil
+		}
+		last = err
+	}
+	return nil, fmt.Errorf("no registered listener port available: %w", last)
+}
+func shutdownHTTPServers(timeout time.Duration, servers ...*http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	done := make(chan struct{}, len(servers))
+	for _, srv := range servers {
+		go func(srv *http.Server) { _ = srv.Shutdown(ctx); _ = srv.Close(); done <- struct{}{} }(srv)
+	}
+	for range servers {
+		<-done
+	}
 }
 
 func printBanner(name, localURL, pairURI, mobileURL string, maxMsgs int, maxMemMB int64) {

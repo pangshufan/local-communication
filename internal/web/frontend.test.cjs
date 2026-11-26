@@ -12,11 +12,14 @@ function harness() {
   const document = {hidden:false,addEventListener(){},getElementById(id){if (!elements.has(id)) elements.set(id,element());return elements.get(id);},createElement:element,querySelectorAll(){return [];},body:element()};
   const sockets = [];
   const calls = [];
-  const context = vm.createContext({document,console,navigator:{},location:{protocol:'https:',host:'192.0.2.1:52520',hostname:'192.0.2.1',hash:'',pathname:'/'},history:{replaceState(){calls.push('remove-fragment');}},window:{addEventListener(){}},setInterval(){},setTimeout(){},URLSearchParams,alert(){},fetch:async (url)=>{calls.push(url);return {ok:true,json:async()=>({self:{peer_id:'self'},peers:[],discoverable:{},stats:{max_messages:2}})};},WebSocket:class {constructor(){sockets.push(this);}}});
+  const timers = new Map();
+  const events = {};
+  let timerID = 0;
+  const context = vm.createContext({document,console,navigator:{},location:{protocol:'https:',host:'192.0.2.1:52520',hostname:'192.0.2.1',hash:'',pathname:'/'},history:{replaceState(){calls.push('remove-fragment');}},window:{addEventListener(name,fn){events[name]=fn;}},setInterval(){},setTimeout(fn,delay){const id=++timerID;timers.set(id,{fn,delay});return id;},clearTimeout(id){timers.delete(id);},AbortController,URLSearchParams,alert(){},fetch:async (url)=>{calls.push(url);return {ok:true,json:async()=>({self:{peer_id:'self'},peers:[],discoverable:{},stats:{max_messages:2}})};},WebSocket:class {constructor(){this.readyState=0;sockets.push(this);}close(code){this.readyState=3;if(this.onclose)this.onclose({code});}}});
   let source = fs.readFileSync(path.join(__dirname,'static/app.js'),'utf8');
   source = source.replace(/  bootstrap\(\)\.catch\([^\n]+\);/, `globalThis.api = {buildMessageCard, deliveryHtml, connectWS, bootstrap, getMessages:()=>messages, setState:(s)=>{appState=s;}};`);
   vm.runInContext(source,context);
-  return {api:context.api,context,sockets,calls};
+  return {api:context.api,context,sockets,calls,timers,events};
 }
 
 test('remote fields cannot inject markup or navigation URLs',()=>{
@@ -45,4 +48,29 @@ test('QR token is removed from browser URL before exchanging for a cookie',async
   const {api,context,calls}=harness();context.location.hash='#token=secret';await api.bootstrap();
   assert.equal(calls[0],'remove-fragment');assert.equal(calls[1],'/api/session');
   assert.ok(!calls.includes('/api/pairing-info'));
+});
+
+test('reconnect uses exponential backoff and stops after eight attempts',async()=>{
+ const h=harness();h.api.connectWS();
+ for(let attempt=0;attempt<8;attempt++){
+  await h.sockets.at(-1).onclose({code:1006});
+  assert.equal(h.timers.size,1);
+  const [id,timer]=[...h.timers][0];
+  assert.equal(timer.delay,Math.min(30000,1000*2**attempt));
+  h.timers.delete(id);timer.fn();
+ }
+ await h.sockets.at(-1).onclose({code:1006});
+ assert.equal(h.sockets.length,9);assert.equal(h.timers.size,0);
+});
+test('server shutdown and pagehide do not schedule reconnect traffic',async()=>{
+ const h=harness();h.api.connectWS();await h.sockets[0].onclose({code:1001});
+ assert.equal(h.timers.size,0);assert.equal(h.calls.length,0);
+ const page=harness();page.api.connectWS();page.events.pagehide();
+ await Promise.resolve();assert.equal(page.timers.size,0);assert.equal(page.calls.length,0);
+});
+test('successful init resets backoff and duplicate connects are ignored',async()=>{
+ const h=harness();h.api.connectWS();h.api.connectWS();assert.equal(h.sockets.length,1);
+ await h.sockets[0].onclose({code:1006});let [id,timer]=[...h.timers][0];h.timers.delete(id);timer.fn();
+ h.sockets[1].onmessage({data:JSON.stringify({type:'init',data:{state:{self:{peer_id:'self'},peers:[],discoverable:{},stats:{max_messages:2}},messages:[]}})});
+ await h.sockets[1].onclose({code:1006});assert.equal([...h.timers.values()][0].delay,1000);
 });

@@ -75,17 +75,48 @@ func PinnedClient(fingerprint string, timeout time.Duration) (*http.Client, erro
 			return nil, err
 		}
 		return &idleConn{Conn: c}, nil
-	}, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 10 * time.Second, IdleConnTimeout: 30 * time.Second, MaxConnsPerHost: 8}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
+	}, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 10 * time.Second, IdleConnTimeout: 60 * time.Second, MaxIdleConns: 64, MaxIdleConnsPerHost: 4, MaxConnsPerHost: 8}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
 }
 
+// PeerClient shares a pinned transport across requests, including file downloads.
+// Callers close response bodies, never the shared connection pool.
 func (im *IdentityManager) PeerClient(peerID string, timeout time.Duration) (*http.Client, error) {
-	p, ok := im.GetTrustedPeer(peerID)
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	p, ok := im.trustedPeers[peerID]
 	if !ok || !ValidPeerIdentity(p.PeerID, p.PublicKeyHex) {
 		return nil, errors.New("untrusted device identity; pair again")
 	}
-	pub, _ := hex.DecodeString(p.PublicKeyHex)
-	h := sha256.Sum256(pub)
-	return PinnedClient(hex.EncodeToString(h[:]), timeout)
+	if im.peerClients == nil {
+		im.peerClients = make(map[string]*http.Client)
+	}
+	base := im.peerClients[peerID]
+	if base == nil {
+		pub, _ := hex.DecodeString(p.PublicKeyHex)
+		h := sha256.Sum256(pub)
+		var err error
+		base, err = PinnedClient(hex.EncodeToString(h[:]), 0)
+		if err != nil {
+			return nil, err
+		}
+		im.peerClients[peerID] = base
+	}
+	client := *base
+	client.Timeout = timeout
+	return &client, nil
+}
+func (im *IdentityManager) closePeerClientLocked(peerID string) {
+	if client := im.peerClients[peerID]; client != nil {
+		client.CloseIdleConnections()
+		delete(im.peerClients, peerID)
+	}
+}
+func (im *IdentityManager) ClosePeerConnections() {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	for id := range im.peerClients {
+		im.closePeerClientLocked(id)
+	}
 }
 
 type idleConn struct{ net.Conn }

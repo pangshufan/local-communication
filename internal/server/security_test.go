@@ -6,7 +6,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -258,5 +260,62 @@ func TestUploadSpoolDownloadRangeAndClear(t *testing.T) {
 	entries, _ := os.ReadDir(s.spoolDir)
 	if len(entries) != 0 {
 		t.Fatal("clear left spool file")
+	}
+}
+
+func TestShutdownCancelsActiveRemoteFileProxy(t *testing.T) {
+	s, im, rb := boundaryServer(t)
+	defer s.Stop()
+	remote := trustedSender(t, im)
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("stream"))
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+		close(finished)
+	}))
+	cfg, err := remote.TLSConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.TLS = cfg
+	ts.StartTLS()
+	defer ts.Close()
+	addr := strings.TrimPrefix(ts.URL, "https://")
+	if err := im.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: remote.PeerID(), LastAddr: addr}); err != nil {
+		t.Fatal(err)
+	}
+	rb.Add(&store.Message{ID: "proxy_stop", Kind: store.KindFile, SenderID: remote.PeerID(), File: &store.FileMeta{FileID: "file_stop", OwnerPeerID: remote.PeerID(), OwnerAddr: addr}})
+	local := httptest.NewServer(s.Handler())
+	defer local.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := http.Get(local.URL + "/api/files/proxy/file_stop")
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not connect")
+	}
+	s.BeginShutdown()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("upstream stream was not canceled")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("local proxy handler did not terminate")
+	}
+	if w := request(t, s, "GET", "/api/state", nil, false, nil); w.Code != 503 {
+		t.Fatal("new requests accepted during shutdown")
 	}
 }

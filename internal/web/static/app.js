@@ -629,15 +629,44 @@
     }, 1000);
   }
 
-  // WebSocket Connection with Auto-Reconnect
+  let activeSocket = null;
+  let reconnectTimer = null;
+  let reconnectAttempts = 0;
+  let reconnectStopped = false;
+  const maxReconnectAttempts = 8;
+  function stopReconnecting() {
+    reconnectStopped = true;
+    if (reconnectTimer !== null) {clearTimeout(reconnectTimer); reconnectTimer = null;}
+  }
+  function scheduleReconnect() {
+    if (reconnectStopped || reconnectTimer !== null) return;
+    if (reconnectAttempts >= maxReconnectAttempts) {
+      stopReconnecting();
+      activeChannelSub.textContent = '连接重试已停止，请确认程序正在运行后刷新页面';
+      return;
+    }
+    const delay = Math.min(30000, 1000 * 2 ** reconnectAttempts++);
+    reconnectTimer = setTimeout(() => {reconnectTimer = null; connectWS();}, delay);
+  }
+  window.addEventListener('pagehide', () => {
+    stopReconnecting();
+    if (activeSocket) activeSocket.close(1000, 'page hidden');
+  });
+  window.addEventListener('pageshow', event => {if (event.persisted) location.reload();});
+
+  // WebSocket reconnects have bounded exponential backoff.
+
   function connectWS() {
+    if (reconnectStopped || (activeSocket && activeSocket.readyState <= 1)) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
+    activeSocket = ws;
     ws.onmessage = (ev) => {
       try {
         const pkt = JSON.parse(ev.data);
         switch (pkt.type) {
           case 'init':
+            reconnectAttempts = 0;
             appState = pkt.data.state || appState;
             messages = pkt.data.messages || [];
             renderState();
@@ -683,10 +712,27 @@
         console.error(err);
       }
     };
-    ws.onclose = async () => {
-      activeChannelSub.textContent = '连接已断开，正在重连…';
-      try { const res = await fetch('/api/state'); if (res.status === 401) {activeChannelSub.textContent = '授权已到期或被撤销，请重新扫码'; return;} } catch {}
-      setTimeout(connectWS, 2000);
+    ws.onclose = async event => {
+      if (activeSocket !== ws) return;
+      activeSocket = null;
+      if (reconnectStopped) return;
+      if (event.code === 1001) {
+        stopReconnecting();
+        activeChannelSub.textContent = '程序已停止；重新启动后刷新页面连接';
+        return;
+      }
+      activeChannelSub.textContent = '连接已断开，正在退避重试…';
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      try {
+        const res = await fetch('/api/state', {signal: controller.signal});
+        if ([401,403,503].includes(res.status)) {
+          stopReconnecting();
+          activeChannelSub.textContent = res.status === 503 ? '程序正在退出；重启后刷新页面' : '授权已到期或被撤销，请重新扫码';
+          return;
+        }
+      } catch {} finally {clearTimeout(timeout);}
+      scheduleReconnect();
     };
   }
 

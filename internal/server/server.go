@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -54,6 +55,13 @@ type AppServer struct {
 	spoolMu        sync.Mutex
 	MaxUploadBytes int64
 	MaxSpoolBytes  int64
+	ctx            context.Context
+	cancel         context.CancelFunc
+	lifeMu         sync.Mutex
+	stopping       bool
+	handlers       sync.WaitGroup
+	shutdownOnce   sync.Once
+	stopOnce       sync.Once
 }
 
 func NewAppServer(
@@ -64,7 +72,9 @@ func NewAppServer(
 	spoolDir string,
 	webFS fs.FS,
 ) *AppServer {
+	ctx, cancel := context.WithCancel(context.Background())
 	s := &AppServer{
+		ctx: ctx, cancel: cancel,
 		identity: im,
 		ring:     rb,
 		wsHub:    NewWSHub(),
@@ -96,12 +106,26 @@ func (s *AppServer) StartMesh() error {
 	return s.mesh.Start()
 }
 
+// BeginShutdown cancels streams and mesh work before HTTP shutdown begins.
+func (s *AppServer) BeginShutdown() {
+	s.shutdownOnce.Do(func() {
+		s.lifeMu.Lock()
+		s.stopping = true
+		s.cancel()
+		s.lifeMu.Unlock()
+		s.mesh.BeginShutdown()
+		s.wsHub.Shutdown()
+	})
+}
 func (s *AppServer) Stop() {
-	s.mesh.Stop()
-	s.wsHub.Close()
-	if s.spoolDir != "" {
-		_ = os.RemoveAll(s.spoolDir)
-	}
+	s.stopOnce.Do(func() {
+		s.BeginShutdown()
+		s.mesh.Stop()
+		s.handlers.Wait()
+		if s.spoolDir != "" {
+			_ = os.RemoveAll(s.spoolDir)
+		}
+	})
 }
 
 func (s *AppServer) Handler() http.Handler {
@@ -236,7 +260,10 @@ func (s *AppServer) requireP2PAuth(next func(w http.ResponseWriter, r *http.Requ
 		// Update peer's latest IP:Port automatically if DHCP changed its IP
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && portStr != "" && validPort(portStr) {
 			peer, _ := s.identity.GetTrustedPeer(senderID)
-			s.identity.SetPeerOnline(senderID, net.JoinHostPort(host, portStr), true)
+			if err := s.identity.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: senderID, LastAddr: net.JoinHostPort(host, portStr), Online: true}); err != nil {
+				http.Error(w, "failed to save peer address", 500)
+				return
+			}
 			if !peer.Online {
 				s.mesh.PeerAvailable(senderID)
 			}
@@ -808,7 +835,6 @@ func (s *AppServer) handleProxyRemoteFile(w http.ResponseWriter, r *http.Request
 		http.Error(w, "untrusted owner", 403)
 		return
 	}
-	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "remote node unreachable: "+err.Error(), http.StatusBadGateway)
@@ -925,13 +951,16 @@ func (s *AppServer) handleP2PPing(w http.ResponseWriter, r *http.Request, sender
 	}
 	if ping.HTTPPort > 0 {
 		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			_ = s.identity.AddOrUpdateTrustedPeer(crypto.TrustedPeer{
+			if err := s.identity.UpdatePeerHeartbeat(crypto.TrustedPeer{
 				PeerID:   senderPeerID,
 				Name:     ping.Name,
 				OS:       ping.OS,
 				LastAddr: fmt.Sprintf("%s:%d", host, ping.HTTPPort),
 				Online:   true,
-			})
+			}); err != nil {
+				http.Error(w, "failed to save peer metadata", 500)
+				return
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

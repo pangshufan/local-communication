@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -55,6 +56,7 @@ type IdentityManager struct {
 	pairingPIN       string
 	pinExpires       time.Time
 	seenProbes       map[[32]byte]time.Time
+	peerClients      map[string]*http.Client
 }
 
 // LoadOrCreateIdentity initializes the node's identity and loads its trusted device list (if any).
@@ -324,6 +326,9 @@ func (im *IdentityManager) AddOrUpdateTrustedPeer(p TrustedPeer) error {
 		}
 		return err
 	}
+	if !ok || previous.PublicKeyHex != p.PublicKeyHex && p.PublicKeyHex != "" || previous.SharedKeyHex != p.SharedKeyHex && p.SharedKeyHex != "" {
+		im.closePeerClientLocked(p.PeerID)
+	}
 	return nil
 }
 
@@ -332,6 +337,7 @@ func (im *IdentityManager) RemoveTrustedPeer(peerID string) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	delete(im.trustedPeers, peerID)
+	im.closePeerClientLocked(peerID)
 	_ = im.saveLocked()
 }
 
@@ -555,4 +561,41 @@ func VerifyPairing(pubHex string, data []byte, sigHex string) bool {
 	pub, e := hex.DecodeString(pubHex)
 	sig, e2 := hex.DecodeString(sigHex)
 	return e == nil && e2 == nil && len(pub) == ed25519.PublicKeySize && ed25519.Verify(ed25519.PublicKey(pub), data, sig)
+}
+
+// UpdatePeerHeartbeat persists only meaningful changes. Online/LastSeen remain
+// volatile, so an unchanged heartbeat does not rewrite identity.json.
+func (im *IdentityManager) UpdatePeerHeartbeat(update TrustedPeer) error {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	p, ok := im.trustedPeers[update.PeerID]
+	if !ok {
+		return errors.New("unknown peer")
+	}
+	if len(update.Name) > 256 || len(update.OS) > 32 || len(update.LastAddr) > 256 {
+		return errors.New("peer fields too long")
+	}
+	previous := *p
+	changed := false
+	if update.Name != "" && update.Name != p.Name {
+		p.Name = update.Name
+		changed = true
+	}
+	if update.OS != "" && update.OS != p.OS {
+		p.OS = update.OS
+		changed = true
+	}
+	if update.LastAddr != "" && update.LastAddr != p.LastAddr {
+		p.LastAddr = update.LastAddr
+		changed = true
+	}
+	p.Online = true
+	p.LastSeen = time.Now().UnixMilli()
+	if changed {
+		if err := im.saveLocked(); err != nil {
+			*p = previous
+			return err
+		}
+	}
+	return nil
 }

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -42,6 +43,31 @@ func sameOrigin(r *http.Request) bool {
 }
 func (s *AppServer) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.lifeMu.Lock()
+		if s.stopping {
+			s.lifeMu.Unlock()
+			http.Error(w, "server shutting down", 503)
+			return
+		}
+		s.handlers.Add(1)
+		s.lifeMu.Unlock()
+		defer s.handlers.Done()
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		callbackDone := make(chan struct{})
+		stop := context.AfterFunc(s.ctx, func() {
+			defer close(callbackDone)
+			cancel()
+			controller := http.NewResponseController(w)
+			_ = controller.SetReadDeadline(time.Now())
+			_ = controller.SetWriteDeadline(time.Now())
+		})
+		defer func() {
+			if !stop() {
+				<-callbackDone
+			}
+		}()
+		r = r.WithContext(ctx)
 		host, port, err := net.SplitHostPort(r.Host)
 		valid := host == "localhost"
 		if ip := net.ParseIP(host); ip != nil {

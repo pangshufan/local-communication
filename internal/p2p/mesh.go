@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	DefaultUDPPort   = 52525
+	DefaultHTTPPort  = 32520
+	DefaultUDPPort   = 32525
 	DiscoverMagicReq = "LANCHAT_SCAN_V1"
 )
 
@@ -78,6 +79,10 @@ type MeshEngine struct {
 	onDelivery   func(string, map[string]string)
 	stopOnce     sync.Once
 	wg           sync.WaitGroup
+	taskMu       sync.Mutex
+	retryMu      sync.Mutex
+	offline      map[string]peerRetry
+	probePending map[string]bool
 }
 
 func NewMeshEngine(
@@ -94,7 +99,8 @@ func NewMeshEngine(
 	ctx, cancel := context.WithCancel(context.Background())
 	return &MeshEngine{
 		ctx: ctx, cancel: cancel, jobs: make(chan deliveryJob, 256), probes: make(chan struct{}, 4),
-		identity:     im,
+		identity: im,
+		offline:  make(map[string]peerRetry), probePending: make(map[string]bool),
 		ring:         rb,
 		httpPort:     httpPort,
 		udpPort:      udpPort,
@@ -109,10 +115,7 @@ func NewMeshEngine(
 func (m *MeshEngine) Start() error {
 	addr := &net.UDPAddr{IP: net.IPv4zero, Port: m.udpPort}
 	conn, err := net.ListenUDP("udp4", addr)
-	if err != nil {
-		// Fallback to ephemeral UDP port if 52525 is already bound by another instance on the same host
-		conn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	}
+
 	if err == nil {
 		m.udpConn = conn
 		m.wg.Add(1)
@@ -128,12 +131,28 @@ func (m *MeshEngine) Start() error {
 	return err
 }
 
-func (m *MeshEngine) Stop() {
-	m.stopOnce.Do(func() { close(m.stopCh); m.cancel() })
-	if m.udpConn != nil {
-		_ = m.udpConn.Close()
+// BeginShutdown stops scheduling work before HTTP servers are drained.
+func (m *MeshEngine) BeginShutdown() {
+	m.taskMu.Lock()
+	defer m.taskMu.Unlock()
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+		m.cancel()
+		if m.udpConn != nil {
+			m.udpConn.Close()
+		}
+	})
+}
+func (m *MeshEngine) Stop() { m.BeginShutdown(); m.wg.Wait(); m.identity.ClosePeerConnections() }
+func (m *MeshEngine) startTask(fn func()) bool {
+	m.taskMu.Lock()
+	defer m.taskMu.Unlock()
+	if m.ctx.Err() != nil {
+		return false
 	}
-	m.wg.Wait()
+	m.wg.Add(1)
+	go func() { defer m.wg.Done(); fn() }()
+	return true
 }
 
 func (m *MeshEngine) udpListenLoop() {
@@ -155,21 +174,7 @@ func (m *MeshEngine) udpListenLoop() {
 		if n == 50 {
 			if senderPeerID, senderHTTPPort, ok := m.identity.VerifySilentProbePacket(pkt); ok {
 				peerAddr := fmt.Sprintf("%s:%d", remoteAddr.IP.String(), senderHTTPPort)
-				select {
-				case m.probes <- struct{}{}:
-					m.wg.Add(1)
-					go func(id, addr string) {
-						defer m.wg.Done()
-						defer func() { <-m.probes }()
-						if m.pingTrustedPeer(id, addr) {
-							m.retryFailed(id)
-							if m.onPeerChange != nil {
-								m.onPeerChange()
-							}
-						}
-					}(senderPeerID, peerAddr)
-				default:
-				}
+				m.startProbePing(senderPeerID, peerAddr)
 
 			}
 			continue
@@ -207,6 +212,11 @@ func (m *MeshEngine) ScanDiscoverablePeers(timeout time.Duration) ([]DiscoveredN
 		return nil, err
 	}
 	defer conn.Close()
+	stop := context.AfterFunc(m.ctx, func() { conn.Close() })
+	defer stop()
+	if m.ctx.Err() != nil {
+		return nil, m.ctx.Err()
+	}
 
 	bcastAddrs := getBroadcastAddrs(m.udpPort)
 	reqBytes := []byte(DiscoverMagicReq)
@@ -235,6 +245,9 @@ func (m *MeshEngine) ScanDiscoverablePeers(timeout time.Duration) ([]DiscoveredN
 		}
 	}
 
+	if m.ctx.Err() != nil {
+		return nil, m.ctx.Err()
+	}
 	out := make([]DiscoveredNode, 0, len(found))
 	for _, v := range found {
 		out = append(out, v)
@@ -291,7 +304,12 @@ func (m *MeshEngine) PairWithPeer(targetAddr string, pin string) (*crypto.Truste
 	body, _ := json.Marshal(reqPayload)
 	url := fmt.Sprintf("https://%s/api/p2p/pair", targetAddr)
 
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(m.ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s failed: %w", targetAddr, err)
 	}
@@ -364,15 +382,25 @@ func (m *MeshEngine) checkAllTrustedPeers() {
 	}
 	changed := false
 	for _, p := range peers {
+		if m.ctx.Err() != nil {
+			return
+		}
+		if !m.heartbeatDue(p.PeerID, time.Now()) {
+			continue
+		}
 		wasOnline := p.Online
 		ok := false
 		if p.LastAddr != "" {
 			ok = m.pingTrustedPeer(p.PeerID, p.LastAddr)
 		}
 		if !ok {
+			m.recordHeartbeat(p.PeerID, false, time.Now())
 			m.identity.SetPeerOnline(p.PeerID, p.LastAddr, false)
 			// Send opaque 50-byte HMAC silent probe in case DHCP changed the trusted peer's IP
 			m.sendSilentProbe(p.PeerID)
+		}
+		if ok {
+			m.recordHeartbeat(p.PeerID, true, time.Now())
 		}
 		if !wasOnline && ok {
 			m.retryFailed(p.PeerID)
@@ -411,10 +439,11 @@ func (m *MeshEngine) pingTrustedPeer(peerID string, addr string) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	if finishControlResponse(resp) != nil {
+		return false
+	}
 	if resp.StatusCode == http.StatusOK {
-		m.identity.SetPeerOnline(peerID, addr, true)
-		return true
+		return m.identity.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: peerID, LastAddr: addr, Online: true}) == nil
 	}
 	return false
 }
@@ -507,9 +536,8 @@ func (m *MeshEngine) deliveryWorker() {
 				}
 				resp, err := m.doSignedPost(peer.PeerID, peer.LastAddr, "/api/p2p/message", body)
 				if err == nil {
-					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-					resp.Body.Close()
-					if resp.StatusCode == http.StatusOK {
+					drainErr := finishControlResponse(resp)
+					if resp.StatusCode == http.StatusOK && drainErr == nil {
 						success = true
 						break
 					}
@@ -541,11 +569,18 @@ func (m *MeshEngine) BroadcastClear() {
 		if p.LastAddr == "" {
 			continue
 		}
-		go func(peer crypto.TrustedPeer) {
-			if resp, err := m.doSignedPost(peer.PeerID, peer.LastAddr, "/api/p2p/clear", body); err == nil {
-				_ = resp.Body.Close()
+		peer := p
+		m.startTask(func() {
+			select {
+			case m.probes <- struct{}{}:
+				defer func() { <-m.probes }()
+			case <-m.ctx.Done():
+				return
 			}
-		}(p)
+			if resp, err := m.doSignedPost(peer.PeerID, peer.LastAddr, "/api/p2p/clear", body); err == nil {
+				_ = finishControlResponse(resp)
+			}
+		})
 	}
 }
 
@@ -573,101 +608,88 @@ func (m *MeshEngine) doSignedPost(targetPeerID string, addr string, path string,
 	if err != nil {
 		return nil, err
 	}
-	defer client.CloseIdleConnections()
 	return client.Do(req)
 }
 
-// GetLANIPs returns all non-loopback IPv4 addresses of the current machine.
-func GetLANIPs() []string {
-	var ips []string
-	ifaces, err := net.Interfaces()
+func (m *MeshEngine) PeerAvailable(peerID string) {
+	m.recordHeartbeat(peerID, true, time.Now())
+	m.retryFailed(peerID)
+}
+
+// Bound error response draining; ordinary control replies are tiny. Oversized
+// or stalled responses are closed instead of consuming unbounded resources.
+func finishControlResponse(resp *http.Response) error {
+	defer resp.Body.Close()
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024+1))
 	if err != nil {
-		return []string{"127.0.0.1"}
+		return err
 	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			var ip net.IP
-			switch v := a.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() {
-				continue
-			}
-			ip4 := ip.To4()
-			if ip4 == nil || ip4.IsLinkLocalUnicast() {
-				continue
-			}
-			ips = append(ips, ip4.String())
-		}
+	if n > 64*1024 {
+		return errors.New("control response exceeds limit")
 	}
-	if len(ips) == 0 {
-		ips = append(ips, "127.0.0.1")
-	}
-	return ips
+	return nil
 }
 
-func selectBestIPForRemote(remoteIP net.IP) string {
-	ips := GetLANIPs()
-	if r4 := remoteIP.To4(); r4 != nil {
-		prefix := fmt.Sprintf("%d.%d.%d.", r4[0], r4[1], r4[2])
-		for _, ip := range ips {
-			if strings.HasPrefix(ip, prefix) {
-				return ip
-			}
-		}
-	}
-	return ips[0]
+type peerRetry struct {
+	failures int
+	next     time.Time
 }
 
-func getBroadcastAddrs(port int) []*net.UDPAddr {
-	seen := make(map[string]bool)
-	var out []*net.UDPAddr
-
-	add := func(ip net.IP) {
-		s := ip.String()
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, &net.UDPAddr{IP: ip, Port: port})
-		}
+func retryDelay(failures int) time.Duration {
+	d := 8 * time.Second
+	for i := 1; i < failures && d < 2*time.Minute; i++ {
+		d *= 2
 	}
-	add(net.IPv4bcast)
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return out
+	if d > 2*time.Minute {
+		d = 2 * time.Minute
 	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok {
-				ip4 := ipnet.IP.To4()
-				mask := ipnet.Mask
-				if ip4 != nil && len(mask) == 4 {
-					bcast := net.IPv4(
-						ip4[0]|^mask[0],
-						ip4[1]|^mask[1],
-						ip4[2]|^mask[2],
-						ip4[3]|^mask[3],
-					)
-					add(bcast)
-				}
+	return d
+}
+func (m *MeshEngine) heartbeatDue(peer string, now time.Time) bool {
+	m.retryMu.Lock()
+	defer m.retryMu.Unlock()
+	return !m.offline[peer].next.After(now)
+}
+func (m *MeshEngine) recordHeartbeat(peer string, success bool, now time.Time) {
+	m.retryMu.Lock()
+	defer m.retryMu.Unlock()
+	if success {
+		delete(m.offline, peer)
+		return
+	}
+	r := m.offline[peer]
+	if r.failures < 8 {
+		r.failures++
+	}
+	r.next = now.Add(retryDelay(r.failures))
+	m.offline[peer] = r
+}
+func (m *MeshEngine) startProbePing(id, addr string) {
+	m.retryMu.Lock()
+	if m.probePending[id] {
+		m.retryMu.Unlock()
+		return
+	}
+	m.probePending[id] = true
+	m.retryMu.Unlock()
+	release := func() { m.retryMu.Lock(); delete(m.probePending, id); m.retryMu.Unlock() }
+	select {
+	case m.probes <- struct{}{}:
+	default:
+		release()
+		return
+	}
+	if !m.startTask(func() {
+		defer release()
+		defer func() { <-m.probes }()
+		if m.pingTrustedPeer(id, addr) {
+			m.PeerAvailable(id)
+			if m.onPeerChange != nil {
+				m.onPeerChange()
 			}
 		}
+	}) {
+		<-m.probes
+		release()
 	}
-	return out
 }
-
-func (m *MeshEngine) PeerAvailable(peerID string) { m.retryFailed(peerID) }
