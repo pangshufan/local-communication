@@ -443,7 +443,8 @@ func (m *MeshEngine) pingTrustedPeer(peerID string, addr string) bool {
 		return false
 	}
 	if resp.StatusCode == http.StatusOK {
-		return m.identity.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: peerID, LastAddr: addr, Online: true}) == nil
+		_, _, err := m.identity.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: peerID, LastAddr: addr})
+		return err == nil
 	}
 	return false
 }

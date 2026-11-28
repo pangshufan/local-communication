@@ -565,37 +565,40 @@ func VerifyPairing(pubHex string, data []byte, sigHex string) bool {
 
 // UpdatePeerHeartbeat persists only meaningful changes. Online/LastSeen remain
 // volatile, so an unchanged heartbeat does not rewrite identity.json.
-func (im *IdentityManager) UpdatePeerHeartbeat(update TrustedPeer) error {
+func (im *IdentityManager) UpdatePeerHeartbeat(update TrustedPeer) (becameOnline, changed bool, err error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	p, ok := im.trustedPeers[update.PeerID]
 	if !ok {
-		return errors.New("unknown peer")
+		return false, false, errors.New("unknown peer")
 	}
 	if len(update.Name) > 256 || len(update.OS) > 32 || len(update.LastAddr) > 256 {
-		return errors.New("peer fields too long")
+		return false, false, errors.New("peer fields too long")
 	}
 	previous := *p
-	changed := false
+	metadataChanged := false
 	if update.Name != "" && update.Name != p.Name {
 		p.Name = update.Name
-		changed = true
+		metadataChanged = true
 	}
 	if update.OS != "" && update.OS != p.OS {
 		p.OS = update.OS
-		changed = true
+		metadataChanged = true
 	}
 	if update.LastAddr != "" && update.LastAddr != p.LastAddr {
 		p.LastAddr = update.LastAddr
-		changed = true
+		metadataChanged = true
 	}
 	p.Online = true
 	p.LastSeen = time.Now().UnixMilli()
-	if changed {
+	if metadataChanged {
 		if err := im.saveLocked(); err != nil {
 			*p = previous
-			return err
+			return false, false, err
 		}
 	}
-	return nil
+	if p.LastAddr != previous.LastAddr {
+		im.closePeerClientLocked(update.PeerID)
+	}
+	return !previous.Online, metadataChanged || !previous.Online, nil
 }

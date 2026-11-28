@@ -69,25 +69,9 @@ func (s *AppServer) guard(next http.Handler) http.Handler {
 		}()
 		r = r.WithContext(ctx)
 		host, port, err := net.SplitHostPort(r.Host)
-		valid := host == "localhost"
-		if ip := net.ParseIP(host); ip != nil {
-			valid = ip.IsLoopback()
-			for _, local := range p2p.GetLANIPs() {
-				if host == local {
-					valid = true
-				}
-			}
-		}
-		if err != nil || !valid || !sameOrigin(r) {
+		if err != nil || !sameOrigin(r) || !validRequestHost(r, host, port) {
 			http.Error(w, "invalid host or origin", http.StatusForbidden)
 			return
-		}
-		if local, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-			_, lp, _ := net.SplitHostPort(local.String())
-			if port != lp {
-				http.Error(w, "invalid listener port", 403)
-				return
-			}
 		}
 		if !isLoopback(r) && r.TLS == nil {
 			http.Error(w, "HTTPS required", http.StatusUpgradeRequired)
@@ -104,7 +88,11 @@ func (s *AppServer) guard(next http.Handler) http.Handler {
 		if r.URL.Path == "/api/files/upload" {
 			timeout = 30 * time.Minute
 		}
-		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(timeout))
+		// A read deadline on a bodyless request would also time out the
+		// HTTP/1 background read and cancel a long-running response.
+		if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(timeout))
+		}
 		if r.URL.Path != "/api/files/upload" {
 			r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 		}
@@ -115,6 +103,18 @@ func (s *AppServer) guard(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+func validRequestHost(r *http.Request, host, port string) bool {
+	ip := net.ParseIP(host)
+	if local, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		localHost, localPort, err := net.SplitHostPort(local.String())
+		localIP := net.ParseIP(localHost)
+		return err == nil && localIP != nil && port == localPort &&
+			(ip.Equal(localIP) || (host == "localhost" && localIP.IsLoopback()))
+	}
+	// Direct handler callers do not have a listener address.
+	return host == "localhost" || ip.IsLoopback()
+}
+
 func (s *AppServer) requireLocal(next http.HandlerFunc) http.HandlerFunc {
 	return s.requireUIAuth(func(w http.ResponseWriter, r *http.Request) {
 		if !isLoopback(r) {

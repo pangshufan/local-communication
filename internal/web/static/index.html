@@ -149,17 +149,17 @@
       </div>
 
       <div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-        <strong>方式一（完全隐身直连，推荐）</strong>：直接粘贴对方界面左上角的 <span class="mono-tag">IP:Port#配对码@设备指纹</span>，无需任何一方开启广播：
+        <strong>直接配对</strong>：直接粘贴对方界面左上角的 <span class="mono-tag">IP:Port#配对码@设备指纹</span>，无需任何一方开启广播：
       </div>
       <div style="display:flex;gap:8px">
-        <input class="input-field" id="pairDirectInput" placeholder="例如 192.168.1.25:52520#839201" />
+        <input class="input-field" id="pairDirectInput" placeholder="粘贴 IP:端口#配对码@设备指纹" />
         <button class="btn btn-primary" id="pairDirectBtn" style="white-space:nowrap">立即配对</button>
       </div>
 
       <hr style="border:0;border-top:1px solid var(--border)" />
 
       <div style="display:flex;justify-content:space-between;align-items:center">
-        <span style="font-size:12px;color:var(--text-muted)"><strong>方式二（局域网扫描）</strong>：仅显示已打开「允许被发现」开关的设备</span>
+        <span style="font-size:12px;color:var(--text-muted)"><strong>局域网扫描</strong>：查找已开启发现的设备。配对时请向对方获取完整配对串。</span>
         <button class="btn btn-sm" id="scanLanBtn">🔍 扫描局域网</button>
       </div>
       <div id="scanResultList" style="display:flex;flex-direction:column;gap:8px;max-height:180px;overflow-y:auto">

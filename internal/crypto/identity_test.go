@@ -181,19 +181,19 @@ func TestUnchangedHeartbeatsDoNotWriteIdentity(t *testing.T) {
 	a, b := testIdentity(t), testIdentity(t)
 	trust(t, a, b)
 	update := TrustedPeer{PeerID: b.PeerID(), Name: "peer", OS: "darwin", LastAddr: "192.168.1.2:32520"}
-	if err := a.UpdatePeerHeartbeat(update); err != nil {
+	if _, _, err := a.UpdatePeerHeartbeat(update); err != nil {
 		t.Fatal(err)
 	}
 	original := a.configPath
 	a.configPath = filepath.Join(t.TempDir(), "missing-dir", "identity.json")
 	// The path cannot be written. An unchanged heartbeat must still succeed.
 	for i := 0; i < 20; i++ {
-		if err := a.UpdatePeerHeartbeat(update); err != nil {
+		if _, _, err := a.UpdatePeerHeartbeat(update); err != nil {
 			t.Fatal("unchanged heartbeat attempted a disk write", err)
 		}
 	}
 	update.Name = "renamed"
-	if err := a.UpdatePeerHeartbeat(update); err == nil {
+	if _, _, err := a.UpdatePeerHeartbeat(update); err == nil {
 		t.Fatal("metadata update did not attempt persistence")
 	}
 	p, _ := a.GetTrustedPeer(b.PeerID())

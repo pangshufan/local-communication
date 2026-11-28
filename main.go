@@ -26,7 +26,9 @@ import (
 	"lanchat/internal/web"
 )
 
-func main() {
+func main() { os.Exit(run()) }
+
+func run() int {
 	var (
 		port        = flag.Int("port", p2p.DefaultHTTPPort, "HTTP/WebUI & P2P listen port (0 for random available port)")
 		udpPort     = flag.Int("udp-port", p2p.DefaultUDPPort, "UDP port for opt-in discovery & silent HMAC probes")
@@ -43,19 +45,23 @@ func main() {
 	flag.Parse()
 	if *port < 0 || *port > 65535 || *udpPort < 1 || *udpPort > 65535 || *maxMsgs < 1 || *maxMsgs > 10000 || *maxMemMB < 1 || *maxMemMB > 4096 || *maxUploadMB < 1 || *maxUploadMB > 1048576 || *maxSpoolMB < *maxUploadMB || *maxSpoolMB > 1048576 {
 		fmt.Fprintln(os.Stderr, "invalid port or resource limits")
-		os.Exit(2)
+		return 2
 	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
 
 	im, err := crypto.LoadOrCreateIdentity(*configDir, *deviceName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to initialize identity: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	spoolDir, cleanupSpool, err := server.CreateSpool(filepath.Join(im.ConfigDir(), "spool"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Failed to create spool:", err)
-		os.Exit(1)
+		return 1
 	}
 	defer cleanupSpool()
 
@@ -71,14 +77,14 @@ func main() {
 	ln, actualPort, err := listenTCPWithFallback(*port)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to bind TCP port: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	defer ln.Close()
 	staticFS, err := web.StaticFS()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to load embedded WebUI: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	appSrv := server.NewAppServer(im, ring, actualPort, *udpPort, spoolDir, staticFS)
@@ -87,12 +93,12 @@ func main() {
 	tlsConfig, err := im.TLSConfig(p2p.GetLANIPs())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return
+		return 1
 	}
-	localLn, err := listenRegisteredTCP("127.0.0.1", p2p.DefaultHTTPPort+1)
+	localLn, err := listenRegisteredTCP("127.0.0.1", p2p.DefaultHTTPPort+1, actualPort)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		return
+		return 1
 	}
 	localSrv := &http.Server{Handler: appSrv.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	go localSrv.Serve(localLn)
@@ -137,8 +143,6 @@ func main() {
 		go interactiveConsoleLoop(im, ring, localURL, actualPort)
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
 	fmt.Println("\n🧹 正在停止通信并清理消息与临时文件...")
@@ -146,12 +150,13 @@ func main() {
 	shutdownHTTPServers(2*time.Second, localSrv, httpSrv)
 	appSrv.Stop()
 	ring.Clear()
+	return 0
 }
 
 func listenTCPWithFallback(preferredPort int) (net.Listener, int, error) {
 	ln, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", preferredPort))
 	if err != nil && preferredPort != 0 {
-		ln, err = listenRegisteredTCP("0.0.0.0", p2p.DefaultHTTPPort)
+		ln, err = listenRegisteredTCP("0.0.0.0", p2p.DefaultHTTPPort, 0)
 	}
 	if err != nil {
 		return nil, 0, err
@@ -161,9 +166,12 @@ func listenTCPWithFallback(preferredPort int) (net.Listener, int, error) {
 }
 
 // Keep automatic listeners below 32768. Explicit --port 0 remains available.
-func listenRegisteredTCP(host string, start int) (net.Listener, error) {
+func listenRegisteredTCP(host string, start, excludedPort int) (net.Listener, error) {
 	var last error
 	for port := start; port < 32768; port++ {
+		if port == excludedPort {
+			continue
+		}
 		ln, err := net.Listen("tcp4", net.JoinHostPort(host, strconv.Itoa(port)))
 		if err == nil {
 			return ln, nil

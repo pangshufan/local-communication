@@ -17,7 +17,7 @@ function harness() {
   let timerID = 0;
   const context = vm.createContext({document,console,navigator:{},location:{protocol:'https:',host:'192.0.2.1:52520',hostname:'192.0.2.1',hash:'',pathname:'/'},history:{replaceState(){calls.push('remove-fragment');}},window:{addEventListener(name,fn){events[name]=fn;}},setInterval(){},setTimeout(fn,delay){const id=++timerID;timers.set(id,{fn,delay});return id;},clearTimeout(id){timers.delete(id);},AbortController,URLSearchParams,alert(){},fetch:async (url)=>{calls.push(url);return {ok:true,json:async()=>({self:{peer_id:'self'},peers:[],discoverable:{},stats:{max_messages:2}})};},WebSocket:class {constructor(){this.readyState=0;sockets.push(this);}close(code){this.readyState=3;if(this.onclose)this.onclose({code});}}});
   let source = fs.readFileSync(path.join(__dirname,'static/app.js'),'utf8');
-  source = source.replace(/  bootstrap\(\)\.catch\([^\n]+\);/, `globalThis.api = {buildMessageCard, deliveryHtml, connectWS, bootstrap, getMessages:()=>messages, setState:(s)=>{appState=s;}};`);
+  source = source.replace(/  bootstrap\(\)\.catch\([^\n]+\);/, `globalThis.api = {buildMessageCard, deliveryHtml, connectWS, bootstrap, removePeer, getMessages:()=>messages, setState:(s)=>{appState=s;}};`);
   vm.runInContext(source,context);
   return {api:context.api,context,sockets,calls,timers,events};
 }
@@ -73,4 +73,20 @@ test('successful init resets backoff and duplicate connects are ignored',async()
  await h.sockets[0].onclose({code:1006});let [id,timer]=[...h.timers][0];h.timers.delete(id);timer.fn();
  h.sockets[1].onmessage({data:JSON.stringify({type:'init',data:{state:{self:{peer_id:'self'},peers:[],discoverable:{},stats:{max_messages:2}},messages:[]}})});
  await h.sockets[1].onclose({code:1006});assert.equal([...h.timers.values()][0].delay,1000);
+});
+
+test('peer list updates preserve the local pairing code', async () => {
+  const {api, context} = harness();
+  context.location.hostname = '127.0.0.1';
+  context.confirm = () => true;
+  const state = {self: {peer_id: 'self'}, peers: [], discoverable: {}, stats: {}};
+  context.fetch = async url => ({
+    ok: true,
+    json: async () => url === '/api/pairing-info' ? {pin: '123456'} : state,
+  });
+  await api.bootstrap();
+  const pin = context.document.getElementById('selfPIN');
+  assert.equal(pin.textContent, '123456');
+  await api.removePeer('other');
+  assert.equal(pin.textContent, '123456');
 });

@@ -257,19 +257,32 @@ func (s *AppServer) requireP2PAuth(next func(w http.ResponseWriter, r *http.Requ
 			return
 		}
 
-		// Update peer's latest IP:Port automatically if DHCP changed its IP
-		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && portStr != "" && validPort(portStr) {
-			peer, _ := s.identity.GetTrustedPeer(senderID)
-			if err := s.identity.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: senderID, LastAddr: net.JoinHostPort(host, portStr), Online: true}); err != nil {
-				http.Error(w, "failed to save peer address", 500)
-				return
-			}
-			if !peer.Online {
-				s.mesh.PeerAvailable(senderID)
+		// Ping carries its listening port in the signed body and updates
+		// address and metadata together in the handler.
+		if r.URL.Path != "/api/p2p/ping" && validPort(portStr) {
+			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				if err := s.observePeer(crypto.TrustedPeer{PeerID: senderID, LastAddr: net.JoinHostPort(host, portStr)}); err != nil {
+					http.Error(w, "failed to save peer address", 500)
+					return
+				}
 			}
 		}
 		next(w, r, senderID, body)
 	}
+}
+
+func (s *AppServer) observePeer(update crypto.TrustedPeer) error {
+	becameOnline, changed, err := s.identity.UpdatePeerHeartbeat(update)
+	if err != nil {
+		return err
+	}
+	if becameOnline {
+		s.mesh.PeerAvailable(update.PeerID)
+	}
+	if changed {
+		s.wsHub.Broadcast("state_update", s.buildStateSnapshot())
+	}
+	return nil
 }
 
 func (s *AppServer) buildStateSnapshot() map[string]any {
@@ -949,18 +962,13 @@ func (s *AppServer) handleP2PPing(w http.ResponseWriter, r *http.Request, sender
 		http.Error(w, "invalid ping", 400)
 		return
 	}
-	if ping.HTTPPort > 0 {
-		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			if err := s.identity.UpdatePeerHeartbeat(crypto.TrustedPeer{
-				PeerID:   senderPeerID,
-				Name:     ping.Name,
-				OS:       ping.OS,
-				LastAddr: fmt.Sprintf("%s:%d", host, ping.HTTPPort),
-				Online:   true,
-			}); err != nil {
-				http.Error(w, "failed to save peer metadata", 500)
-				return
-			}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		if err := s.observePeer(crypto.TrustedPeer{
+			PeerID: senderPeerID, Name: ping.Name, OS: ping.OS,
+			LastAddr: net.JoinHostPort(host, strconv.Itoa(ping.HTTPPort)),
+		}); err != nil {
+			http.Error(w, "failed to save peer metadata", 500)
+			return
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})

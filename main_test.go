@@ -22,13 +22,13 @@ func TestAutomaticTCPFallbackUsesRegisteredPort(t *testing.T) {
 	if port < 32520 || port >= 32768 {
 		t.Fatal("automatic fallback selected an ephemeral-range port", port)
 	}
-	local, err := listenRegisteredTCP("127.0.0.1", 32521)
+	local, err := listenRegisteredTCP("127.0.0.1", 32521, 32521)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer local.Close()
-	if local.Addr().(*net.TCPAddr).Port >= 32768 {
-		t.Fatal("local UI uses ephemeral range")
+	if local.Addr().(*net.TCPAddr).Port == 32521 || local.Addr().(*net.TCPAddr).Port >= 32768 {
+		t.Fatal("local UI selected an excluded or ephemeral port")
 	}
 }
 func TestShutdownForcesActiveHTTPConnectionClosed(t *testing.T) {

@@ -284,7 +284,7 @@ func TestShutdownCancelsActiveRemoteFileProxy(t *testing.T) {
 	ts.StartTLS()
 	defer ts.Close()
 	addr := strings.TrimPrefix(ts.URL, "https://")
-	if err := im.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: remote.PeerID(), LastAddr: addr}); err != nil {
+	if _, _, err := im.UpdatePeerHeartbeat(crypto.TrustedPeer{PeerID: remote.PeerID(), LastAddr: addr}); err != nil {
 		t.Fatal(err)
 	}
 	rb.Add(&store.Message{ID: "proxy_stop", Kind: store.KindFile, SenderID: remote.PeerID(), File: &store.FileMeta{FileID: "file_stop", OwnerPeerID: remote.PeerID(), OwnerAddr: addr}})

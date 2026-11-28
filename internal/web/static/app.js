@@ -1,7 +1,7 @@
 (() => {
   let appState = {
     self: {},
-    discoverable: { enabled: false, pin: '', remaining_sec: 0, pair_uri: '' },
+    discoverable: { enabled: false, remaining_sec: 0 },
     peers: [],
     stats: { current_messages: 0, max_messages: 200, current_bytes: 0, max_bytes: 20971520 },
   };
@@ -16,6 +16,7 @@
   const stealthBadge = document.getElementById('stealthBadge');
   const selfNameEl = document.getElementById('selfName');
   const selfAddrEl = document.getElementById('selfAddr');
+  let pairingInfo = {};
   const selfPINEl = document.getElementById('selfPIN');
   const copyPairUriBtn = document.getElementById('copyPairUriBtn');
   const toggleDiscoverBtn = document.getElementById('toggleDiscoverBtn');
@@ -65,7 +66,7 @@
       selfAddrEl.textContent = self.primary_addr || '-';
     }
     if (discoverable) {
-      selfPINEl.textContent = discoverable.pin || '------';
+      selfPINEl.textContent = pairingInfo.pin || '------';
       if (discoverable.enabled && discoverable.remaining_sec > 0) {
         stealthBadge.textContent = `📡 可被发现 (${discoverable.remaining_sec}s)`;
         stealthBadge.classList.add('discoverable');
@@ -451,14 +452,13 @@
     if (res.ok) {
       appState = await res.json();
       renderState();
+      await refreshPairingInfo();
     }
   };
 
   copyPairUriBtn.onclick = async () => {
-    await refreshPairingInfo();
-    if (appState.discoverable && appState.discoverable.pair_uri) {
-      copyToClipboard(appState.discoverable.pair_uri, copyPairUriBtn);
-    }
+    const info = await refreshPairingInfo();
+    if (info?.pair_uri) copyToClipboard(info.pair_uri, copyPairUriBtn);
   };
 
   // Clear Memory Buttons
@@ -540,7 +540,7 @@
     const data = await res.json();
     const nodes = data.discovered || [];
     if (nodes.length === 0) {
-      listEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted);text-align:center;padding:12px">未发现处于开放状态的设备。请确认目标设备已点击「允许被发现」，或直接使用上方 IP:Port#配对码 隐身直连。</div>';
+      listEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted);text-align:center;padding:12px">未发现处于开放状态的设备。请确认目标设备已点击「允许被发现」，或直接使用上方完整配对串直连。</div>';
       return;
     }
     listEl.innerHTML = '';
@@ -552,15 +552,7 @@
           <div style="font-size:13px;font-weight:600">${escapeHtml(n.name)}</div>
           <div style="font-size:11px;color:var(--text-muted)">${osIcon(n.os)} · ${escapeHtml(n.addr)}</div>
         </div>
-        <div style="display:flex;gap:6px">
-          <input class="input-field" style="width:95px;padding:5px 8px" placeholder="6位配对码" data-pin-for="${escapeHtml(n.addr)}" />
-          <button class="btn btn-primary btn-sm" data-pair-addr="${escapeHtml(n.addr)}">配对</button>
-        </div>
       `;
-      row.querySelector('[data-pair-addr]').onclick = () => {
-        document.getElementById('pairDirectInput').focus();
-        alert('请从目标电脑复制完整配对串 IP:Port#配对码@设备指纹，粘贴到手动配对输入框。扫描结果不能验证设备身份。');
-      };
       listEl.appendChild(row);
     });
   };
@@ -744,7 +736,13 @@
     const local = ['127.0.0.1','localhost','[::1]'].includes(location.hostname);
     document.querySelectorAll('[data-host-only]').forEach(el => {el.hidden = !local;});
     if (!local) return;
-    try {const res = await fetch('/api/pairing-info'); if (res.ok) {const info = await res.json(); Object.assign(appState.discoverable, info); selfPINEl.textContent = info.pin;}} catch {}
+    try {
+      const res = await fetch('/api/pairing-info');
+      if (!res.ok) return;
+      pairingInfo = await res.json();
+      selfPINEl.textContent = pairingInfo.pin || '------';
+      return pairingInfo;
+    } catch {}
   }
   async function bootstrap() {
     const token = new URLSearchParams(location.hash.slice(1)).get('token');
